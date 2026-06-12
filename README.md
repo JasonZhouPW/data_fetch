@@ -4,10 +4,19 @@
 
 ## 运行
 
+GitHub token 可在项目根目录配置 `token.json`：
+
+```json
+{
+  "github": "ghp_xxx"
+}
+```
+
+GitHub token 读取优先级为：命令行参数 > `token.json` > 环境变量。GitLab 默认不读取 `token.json`，公开项目会不带 token 请求；如需 GitLab token，显式传 `--gitlab-token`。
+
 完整启动命令示例：
 
 ```bash
-export GITHUB_TOKEN=ghp_xxx  # 可选，但建议设置以提高 API 限额
 python3 -m github_code_harvester \
   --output-dir final_data \
   --work-dir .cache/github_repos \
@@ -20,8 +29,7 @@ python3 -m github_code_harvester \
   --target-repos 100 \
   --max-repos 100 \
   --clone-workers 1 \
-  --workers 10 \
-  --github-token "$GITHUB_TOKEN"
+  --workers 10
 ```
 
 第一步会生成仓库清单：
@@ -36,16 +44,18 @@ group_repo.csv
 group_repo,url,language,star,author,project_type
 ```
 
-如果 `group_repo.csv` 已存在，脚本会默认直接读取它并跳过 GitHub repo 搜索，避免重复生成清单。需要重新搜集 100 个 repo 时，加：
+如果 `group_repo.csv` 已存在，脚本会默认直接读取它并跳过 GitHub repo 搜索，避免重复生成清单。此时 `--languages`、`--min-stars`、`--repos-per-language`、`--target-repos` 和 `--max-repos` 不会改变已有 CSV 的语言分布；例如当前 CSV 只有 Go 项目时，即使命令里写了 `--languages Go Java Python JavaScript C++`，仍然只会处理 CSV 里的 Go 项目。
+
+需要按多语言重新搜集 100 个 repo 时，加：
 
 ```bash
---refresh-repo-csv
+--refresh-repo-csv --languages Go Java Python JavaScript C++ --target-repos 100
 ```
 
-如果要在已有 `group_repo.csv` 后面继续追加 100 个不重复 repo，加：
+如果要在已有 `group_repo.csv` 后面继续追加 100 个不重复 repo，例如补充 Java、Python、JavaScript、C++，加：
 
 ```bash
---append-repo-csv --target-repos 100
+--append-repo-csv --languages Java Python JavaScript C++ --target-repos 100
 ```
 
 追加后脚本会读取完整 CSV 进入处理流程；已存在 `final_data/<group_repo>.jsonl` 的 repo 会自动跳过，所以不需要单独记录“本次新增列表”。
@@ -68,7 +78,7 @@ group_repo,url,language,star,author,project_type
 | `--max-repos` | 不限制 | 最大可处理仓库数；用于搜索或追加时会覆盖 `--target-repos`。 |
 | `--workers` | `10` | commit JSON 生成线程数，实际最小值为 1。 |
 | `--clone-workers` | `1` | clone/fetch 线程数，实际最小值为 1。 |
-| `--github-token` | 环境变量 `GITHUB_TOKEN` | GitHub API token；可通过参数传入，也可使用环境变量。 |
+| `--github-token` | `token.json` 的 `github` 字段，或环境变量 `GITHUB_TOKEN` | GitHub API token；命令行参数优先级最高。 |
 | `--keep-repos` | 关闭 | 保留 clone 后的仓库目录；默认处理完会删除 clone 目录和中间 commit JSON 目录。 |
 | `--repo` | 空 | 处理指定仓库，可重复传入，例如 `--repo fatedier/frp --repo psf/requests`；使用该参数时会按指定仓库生成/覆盖 CSV。 |
 | `--max-commits` | 不限制 | 每个仓库最多处理的符合条件 commit 数，适合小样本测试。 |
@@ -111,7 +121,6 @@ final_data/owner__repo.jsonl
 ## 小样本测试
 
 ```bash
-export GITHUB_TOKEN=$(sed -n '1p' tokens.txt)
 python3 -m github_code_harvester \
   --repo fatedier/frp \
   --output-dir final_data \
@@ -123,3 +132,53 @@ python3 -m github_code_harvester \
   --clone-workers 1 \
   --workers 1
 ```
+
+## GitLab 数据采集
+
+新增 GitLab 入口会复用同一套 clone、commit 过滤和 JSONL 生成逻辑，输出格式与 GitHub 数据一致；区别是 `meta.data_info.source` 会写为 `GitLab`。
+
+GitLab 的过滤要求与 GitHub 保持一致：项目 star 必须严格大于 `--min-stars`，排除 archived 和 mirror 项目，并继续使用名称、描述、topics 中的教学/示例/合成数据关键词过滤；commit 仍然复用同一套非 merge commit、代码文件比例、目录、文件类型和单文件大小过滤。
+
+完整启动命令示例：
+
+```bash
+python3 -m gitlab_code_harvester \
+  --output-dir final_data_gitlab \
+  --work-dir .cache/gitlab_repos \
+  --commit-work-dir .cache/gitlab_commit_json \
+  --repo-csv gitlab_group_repo.csv \
+  --since 2025-10-01 \
+  --languages Go Java Python JavaScript C++ \
+  --min-stars 5000 \
+  --repos-per-language 100 \
+  --target-repos 100 \
+  --max-repos 100 \
+  --clone-workers 1 \
+  --workers 10 \
+  --gitlab-base-url https://gitlab.com
+```
+
+处理指定 GitLab 项目：
+
+```bash
+python3 -m gitlab_code_harvester \
+  --repo gitlab-org/gitlab \
+  --output-dir final_data_gitlab \
+  --repo-csv gitlab_group_repo.csv \
+  --work-dir .cache/test_gitlab_repos \
+  --commit-work-dir .cache/test_gitlab_commit_json \
+  --since 2025-10-01 \
+  --max-commits 3 \
+  --clone-workers 1 \
+  --workers 1
+```
+
+GitLab 专用参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--gitlab-base-url` | `https://gitlab.com` 或环境变量 `GITLAB_BASE_URL` | GitLab 实例地址；自建 GitLab 可改成内网域名。 |
+| `--gitlab-token` | 空 | GitLab API token；默认不读取 `token.json`，只有显式传入时才会通过 `PRIVATE-TOKEN` 请求头发送。 |
+| `--repo` | 空 | 指定 GitLab 项目路径，可重复传入，例如 `--repo group/project --repo group/subgroup/project`。 |
+
+其他参数与 GitHub 入口含义一致，包括 `--output-dir`、`--work-dir`、`--commit-work-dir`、`--repo-csv`、`--refresh-repo-csv`、`--append-repo-csv`、`--since`、`--languages`、`--min-stars`、`--repos-per-language`、`--target-repos`、`--max-repos`、`--workers`、`--clone-workers`、`--keep-repos` 和 `--max-commits`。

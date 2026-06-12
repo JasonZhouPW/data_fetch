@@ -22,6 +22,9 @@ from typing import Iterable, Sequence
 LANGUAGES = ("Go", "Java", "Python", "JavaScript", "C++")
 SINCE_DATE = "2025-10-01"
 SOURCE_NAME = "GitHub"
+GITLAB_SOURCE_NAME = "GitLab"
+GITLAB_BASE_URL = "https://gitlab.com"
+TOKEN_CONFIG_PATH = "token.json"
 
 CODE_EXTENSIONS = {
     ".c",
@@ -99,6 +102,7 @@ class RepoInfo:
     description: str
     topics: list[str]
     pushed_at: str
+    source: str = SOURCE_NAME
 
 
 @dataclass(frozen=True)
@@ -127,11 +131,64 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible repositories to process.")
     parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
     parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
-    parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN"), help="Optional GitHub token.")
+    parser.add_argument("--github-token", default=None, help="Optional GitHub token. Overrides token.json and GITHUB_TOKEN.")
     parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
     parser.add_argument("--repo", action="append", default=[], help="Process an explicit GitHub repo, e.g. owner/name.")
     parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
     return parser.parse_args(argv)
+
+
+def parse_gitlab_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch high-star GitLab projects and generate per-project JSONL code snapshots."
+    )
+    parser.add_argument("--output-dir", default="final_data_gitlab", help="Directory for final per-repo JSONL files.")
+    parser.add_argument("--work-dir", default=".cache/gitlab_repos", help="Directory for cloned repositories.")
+    parser.add_argument("--commit-work-dir", default=".cache/gitlab_commit_json", help="Directory for intermediate commit JSON files.")
+    parser.add_argument("--repo-csv", default="gitlab_group_repo.csv", help="CSV path for selected repositories.")
+    parser.add_argument("--refresh-repo-csv", action="store_true", help="Ignore an existing repo CSV and fetch a fresh repository list.")
+    parser.add_argument("--append-repo-csv", action="store_true", help="Fetch new repositories not already in repo CSV, append them, and process the CSV.")
+    parser.add_argument("--since", default=SINCE_DATE, help="Only read commits after this date, YYYY-MM-DD.")
+    parser.add_argument("--languages", nargs="+", default=list(LANGUAGES), help="GitLab programming languages to search.")
+    parser.add_argument("--min-stars", type=int, default=5_000, help="Minimum stars for project candidates.")
+    parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate projects per language.")
+    parser.add_argument("--target-repos", type=int, default=100, help="Target total projects to collect.")
+    parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible projects to process.")
+    parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
+    parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
+    parser.add_argument("--gitlab-base-url", default=os.getenv("GITLAB_BASE_URL", GITLAB_BASE_URL), help="GitLab instance base URL.")
+    parser.add_argument("--gitlab-token", default=None, help="Optional GitLab token. GitLab does not read token.json by default.")
+    parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
+    parser.add_argument("--repo", action="append", default=[], help="Process an explicit GitLab project path, e.g. group/subgroup/project.")
+    parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
+    return parser.parse_args(argv)
+
+
+def load_token_config(token_path: Path = Path(TOKEN_CONFIG_PATH)) -> dict[str, str]:
+    if not token_path.exists():
+        return {}
+    data = json.loads(token_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(key): str(value).strip()
+        for key, value in data.items()
+        if value is not None and str(value).strip()
+    }
+
+
+def resolve_token(
+    explicit_token: str | None,
+    provider: str,
+    env_name: str,
+    token_path: Path = Path(TOKEN_CONFIG_PATH),
+) -> str | None:
+    if explicit_token:
+        return explicit_token
+    config_token = load_token_config(token_path).get(provider)
+    if config_token:
+        return config_token
+    return os.getenv(env_name)
 
 
 def is_eligible_repo(repo: RepoInfo) -> bool:
@@ -228,9 +285,17 @@ def read_repo_csv(csv_path: Path) -> list[RepoInfo]:
                     description="",
                     topics=[],
                     pushed_at="",
+                    source=infer_source_from_url(html_url),
                 )
             )
     return repos
+
+
+def infer_source_from_url(url: str) -> str:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if "gitlab" in host:
+        return GITLAB_SOURCE_NAME
+    return SOURCE_NAME
 
 
 def is_code_commit(
@@ -308,7 +373,7 @@ def build_record(
         "meta": {
             "data_info": {
                 "lang": repo.language,
-                "source": SOURCE_NAME,
+                "source": repo.source,
                 "url": repo.html_url,
                 "type": "代码",
                 "author": commit.author,
@@ -462,6 +527,97 @@ def fetch_repo(repo_name: str, github_token: str | None = None) -> RepoInfo:
     )
 
 
+def normalize_base_url(base_url: str) -> str:
+    return base_url.rstrip("/")
+
+
+def gitlab_project_to_repo(item: dict, language: str | None = None) -> RepoInfo:
+    full_name = item["path_with_namespace"]
+    topics = item.get("topics")
+    if topics is None:
+        topics = item.get("tag_list") or []
+    return RepoInfo(
+        full_name=full_name,
+        clone_url=item.get("http_url_to_repo") or f"{item['web_url']}.git",
+        html_url=item["web_url"],
+        language=item.get("language") or language or "unknown",
+        stargazers_count=int(item.get("star_count") or 0),
+        description=item.get("description") or "",
+        topics=list(topics or []),
+        pushed_at=item.get("last_activity_at") or item.get("updated_at") or "",
+        source=GITLAB_SOURCE_NAME,
+    )
+
+
+def fetch_high_star_gitlab_projects(
+    languages: Sequence[str],
+    min_stars: int,
+    repos_per_language: int,
+    gitlab_base_url: str = GITLAB_BASE_URL,
+    gitlab_token: str | None = None,
+    max_repos: int | None = None,
+    existing_repo_names: set[str] | None = None,
+) -> list[RepoInfo]:
+    repos: list[RepoInfo] = []
+    seen: set[str] = set(existing_repo_names or set())
+    base_url = normalize_base_url(gitlab_base_url)
+    for language in languages:
+        page = 1
+        language_selected = 0
+        while language_selected < repos_per_language and page <= 10:
+            params = urllib.parse.urlencode(
+                {
+                    "visibility": "public",
+                    "archived": "false",
+                    "order_by": "star_count",
+                    "sort": "desc",
+                    "simple": "true",
+                    "per_page": min(100, max(10, repos_per_language * 3)),
+                    "page": page,
+                    "with_programming_language": language,
+                }
+            )
+            payload = gitlab_get_json(f"{base_url}/api/v4/projects?{params}", gitlab_token)
+            if not isinstance(payload, list) or not payload:
+                break
+            candidates = [
+                gitlab_project_to_repo(item, language=language)
+                for item in payload
+                if is_gitlab_search_candidate(item, min_stars)
+            ]
+            remaining_for_language = repos_per_language - language_selected
+            remaining_total = None if max_repos is None else max_repos - len(repos)
+            limit = remaining_for_language
+            if remaining_total is not None:
+                limit = min(limit, remaining_total)
+            selected = select_eligible_repos(candidates, max_repos=limit, seen=seen)
+            repos.extend(selected)
+            language_selected += len(selected)
+            if max_repos is not None and len(repos) >= max_repos:
+                return repos
+            page += 1
+    return repos
+
+
+def is_gitlab_search_candidate(item: dict, min_stars: int) -> bool:
+    return (
+        int(item.get("star_count") or 0) > min_stars
+        and not bool(item.get("archived"))
+        and not bool(item.get("mirror"))
+    )
+
+
+def fetch_gitlab_project(
+    project_path: str,
+    gitlab_base_url: str = GITLAB_BASE_URL,
+    gitlab_token: str | None = None,
+) -> RepoInfo:
+    encoded = urllib.parse.quote(project_path.strip(), safe="")
+    base_url = normalize_base_url(gitlab_base_url)
+    item = gitlab_get_json(f"{base_url}/api/v4/projects/{encoded}", gitlab_token)
+    return gitlab_project_to_repo(item)
+
+
 def github_get_json(url: str, github_token: str | None) -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -470,6 +626,18 @@ def github_get_json(url: str, github_token: str | None) -> dict:
     }
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def gitlab_get_json(url: str, gitlab_token: str | None) -> dict | list:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "gitlab-code-harvester",
+    }
+    if gitlab_token:
+        headers["PRIVATE-TOKEN"] = gitlab_token
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -766,8 +934,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     start = time.time()
     repo_csv_path = Path(args.repo_csv)
+    github_token = resolve_token(args.github_token, "github", "GITHUB_TOKEN")
     if args.repo:
-        repos = [fetch_repo(repo_name, args.github_token) for repo_name in args.repo]
+        repos = [fetch_repo(repo_name, github_token) for repo_name in args.repo]
     elif args.append_repo_csv:
         existing = read_repo_csv(repo_csv_path) if repo_csv_path.exists() else []
         existing_names = {repo.full_name for repo in existing}
@@ -776,7 +945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             languages=args.languages,
             min_stars=args.min_stars,
             repos_per_language=args.repos_per_language,
-            github_token=args.github_token,
+            github_token=github_token,
             max_repos=target_new_repos,
             existing_repo_names=existing_names,
         )
@@ -796,10 +965,76 @@ def main(argv: Sequence[str] | None = None) -> int:
             languages=args.languages,
             min_stars=args.min_stars,
             repos_per_language=args.repos_per_language,
-            github_token=args.github_token,
+            github_token=github_token,
             max_repos=max_repos,
         )
     print(f"Selected {len(repos)} repositories", flush=True)
+    if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
+        write_repo_csv(repos, repo_csv_path)
+        print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
+    run_pipeline(
+        repos=repos,
+        work_dir=Path(args.work_dir),
+        output_dir=Path(args.output_dir),
+        commit_work_dir=Path(args.commit_work_dir),
+        since=args.since,
+        jsonl_workers=max(1, args.workers),
+        clone_workers=max(1, args.clone_workers),
+        keep_repos=args.keep_repos,
+        max_commits=args.max_commits,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def gitlab_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_gitlab_args(argv)
+    start = time.time()
+    repo_csv_path = Path(args.repo_csv)
+    gitlab_token = args.gitlab_token
+    if args.repo:
+        repos = [
+            fetch_gitlab_project(
+                repo_name,
+                gitlab_base_url=args.gitlab_base_url,
+                gitlab_token=gitlab_token,
+            )
+            for repo_name in args.repo
+        ]
+    elif args.append_repo_csv:
+        existing = read_repo_csv(repo_csv_path) if repo_csv_path.exists() else []
+        existing_names = {repo.full_name for repo in existing}
+        target_new_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_gitlab_projects(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            gitlab_base_url=args.gitlab_base_url,
+            gitlab_token=gitlab_token,
+            max_repos=target_new_repos,
+            existing_repo_names=existing_names,
+        )
+        repos = append_repo_csv(repos, repo_csv_path)
+        print(
+            f"Appended {len(repos)} new projects to {args.repo_csv}; existing count was {len(existing)}",
+            flush=True,
+        )
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} total projects from {args.repo_csv}", flush=True)
+    elif repo_csv_path.exists() and not args.refresh_repo_csv:
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} projects from {args.repo_csv}", flush=True)
+    else:
+        max_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_gitlab_projects(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            gitlab_base_url=args.gitlab_base_url,
+            gitlab_token=gitlab_token,
+            max_repos=max_repos,
+        )
+    print(f"Selected {len(repos)} projects", flush=True)
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
         write_repo_csv(repos, repo_csv_path)
         print(f"Wrote repo CSV to {args.repo_csv}", flush=True)

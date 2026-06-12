@@ -12,6 +12,9 @@ from github_code_harvester.harvester import (
     build_record,
     checkout_commit,
     cleanup_project_workspace,
+    fetch_gitlab_project,
+    fetch_high_star_gitlab_projects,
+    gitlab_project_to_repo,
     is_code_commit,
     is_eligible_repo,
     infer_project_type,
@@ -19,6 +22,7 @@ from github_code_harvester.harvester import (
     process_repo,
     process_repo_to_commit_jsons,
     read_repo_csv,
+    resolve_token,
     repo_to_csv_row,
     run_pipeline,
     select_eligible_repos,
@@ -301,6 +305,224 @@ def test_build_record_uses_commit_hash_id_and_required_metadata():
         "public_date": "2025-11-02T03:04:05+00:00",
         "project_type": "网站前端",
     }
+
+
+def test_build_record_uses_repo_source_for_gitlab_records():
+    repo = RepoInfo(
+        full_name="group/project",
+        clone_url="https://gitlab.com/group/project.git",
+        html_url="https://gitlab.com/group/project",
+        language="Python",
+        stargazers_count=3_000,
+        description="Production data pipeline.",
+        topics=["pipeline"],
+        pushed_at="2026-01-02T03:04:05Z",
+        source="GitLab",
+    )
+    commit = CommitInfo(
+        sha="abc123",
+        author="GitLab User",
+        author_date=dt.datetime(2025, 11, 2, 3, 4, 5, tzinfo=dt.UTC),
+        changed_files=["src/app.py"],
+    )
+
+    record = build_record(
+        repo=repo,
+        commit=commit,
+        text="print('hello')\n",
+        project_type="通用软件项目",
+    )
+
+    assert record["meta"]["data_info"]["source"] == "GitLab"
+    assert record["meta"]["data_info"]["url"] == "https://gitlab.com/group/project"
+
+
+def test_resolve_token_reads_provider_field_from_token_json(tmp_path: Path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    token_path.write_text(
+        json.dumps({"github": "github-json-token", "gitlab": "gitlab-json-token"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    assert resolve_token(None, "github", "GITHUB_TOKEN", token_path) == "github-json-token"
+
+
+def test_resolve_token_prefers_cli_value_then_falls_back_to_env(tmp_path: Path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    token_path.write_text(json.dumps({"github": "github-json-token"}), encoding="utf-8")
+    monkeypatch.setenv("GITLAB_TOKEN", "gitlab-env-token")
+
+    assert resolve_token("cli-token", "github", "GITHUB_TOKEN", token_path) == "cli-token"
+    assert resolve_token(None, "gitlab", "GITLAB_TOKEN", token_path) == "gitlab-env-token"
+
+
+def test_gitlab_main_does_not_read_token_json_by_default(tmp_path: Path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    token_path.write_text(
+        json.dumps({"gitlab": "bad-token-from-json"}),
+        encoding="utf-8",
+    )
+    seen: dict[str, str | None] = {}
+
+    def fake_fetch_project(
+        project_path: str,
+        gitlab_base_url: str = "https://gitlab.com",
+        gitlab_token: str | None = None,
+    ) -> RepoInfo:
+        seen["token"] = gitlab_token
+        return RepoInfo(
+            full_name=project_path,
+            clone_url=f"https://gitlab.com/{project_path}.git",
+            html_url=f"https://gitlab.com/{project_path}",
+            language="Go",
+            stargazers_count=1200,
+            description="Production runner.",
+            topics=[],
+            pushed_at="",
+            source="GitLab",
+        )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setattr(harvester, "fetch_gitlab_project", fake_fetch_project)
+    monkeypatch.setattr(harvester, "run_pipeline", lambda **kwargs: None)
+
+    assert harvester.gitlab_main(["--repo", "group/project"]) == 0
+
+    assert seen["token"] is None
+
+
+def test_gitlab_project_to_repo_maps_api_payload():
+    repo = gitlab_project_to_repo(
+        {
+            "path_with_namespace": "group/project",
+            "http_url_to_repo": "https://gitlab.com/group/project.git",
+            "web_url": "https://gitlab.com/group/project",
+            "star_count": 4567,
+            "description": "A backend API service.",
+            "topics": ["api"],
+            "last_activity_at": "2026-01-02T03:04:05Z",
+        },
+        language="Python",
+    )
+
+    assert repo == RepoInfo(
+        full_name="group/project",
+        clone_url="https://gitlab.com/group/project.git",
+        html_url="https://gitlab.com/group/project",
+        language="Python",
+        stargazers_count=4567,
+        description="A backend API service.",
+        topics=["api"],
+        pushed_at="2026-01-02T03:04:05Z",
+        source="GitLab",
+    )
+
+
+def test_fetch_gitlab_project_uses_encoded_namespace_and_private_token(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_get_json(url: str, token: str | None) -> dict:
+        seen["url"] = url
+        seen["token"] = token
+        return {
+            "path_with_namespace": "group/sub/project",
+            "http_url_to_repo": "https://gitlab.example.com/group/sub/project.git",
+            "web_url": "https://gitlab.example.com/group/sub/project",
+            "star_count": 12,
+            "description": "Internal service.",
+            "topics": [],
+            "last_activity_at": "2026-01-02T03:04:05Z",
+        }
+
+    monkeypatch.setattr(harvester, "gitlab_get_json", fake_get_json)
+
+    repo = fetch_gitlab_project(
+        "group/sub/project",
+        gitlab_base_url="https://gitlab.example.com",
+        gitlab_token="secret",
+    )
+
+    assert seen == {
+        "url": "https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject",
+        "token": "secret",
+    }
+    assert repo.full_name == "group/sub/project"
+    assert repo.source == "GitLab"
+
+
+def test_fetch_high_star_gitlab_projects_searches_by_language_and_filters(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(url: str, token: str | None) -> list[dict]:
+        calls.append(url)
+        return [
+            {
+                "path_with_namespace": "group/tutorial",
+                "http_url_to_repo": "https://gitlab.com/group/tutorial.git",
+                "web_url": "https://gitlab.com/group/tutorial",
+                "star_count": 9000,
+                "description": "Tutorial project.",
+                "topics": ["tutorial"],
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+            {
+                "path_with_namespace": "group/exact-threshold",
+                "http_url_to_repo": "https://gitlab.com/group/exact-threshold.git",
+                "web_url": "https://gitlab.com/group/exact-threshold",
+                "star_count": 5000,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+            {
+                "path_with_namespace": "group/archived",
+                "http_url_to_repo": "https://gitlab.com/group/archived.git",
+                "web_url": "https://gitlab.com/group/archived",
+                "star_count": 7000,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "archived": True,
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+            {
+                "path_with_namespace": "group/mirror",
+                "http_url_to_repo": "https://gitlab.com/group/mirror.git",
+                "web_url": "https://gitlab.com/group/mirror",
+                "star_count": 7000,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "mirror": True,
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+            {
+                "path_with_namespace": "group/service",
+                "http_url_to_repo": "https://gitlab.com/group/service.git",
+                "web_url": "https://gitlab.com/group/service",
+                "star_count": 8000,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+        ]
+
+    monkeypatch.setattr(harvester, "gitlab_get_json", fake_get_json)
+
+    repos = fetch_high_star_gitlab_projects(
+        languages=["Python"],
+        min_stars=5000,
+        repos_per_language=10,
+        gitlab_base_url="https://gitlab.com",
+        gitlab_token=None,
+        max_repos=1,
+    )
+
+    assert len(repos) == 1
+    assert repos[0].full_name == "group/service"
+    assert repos[0].source == "GitLab"
+    assert "with_programming_language=Python" in calls[0]
+    assert "order_by=star_count" in calls[0]
 
 
 def test_write_jsonl_for_commit_writes_one_record_with_all_code(tmp_path: Path):
