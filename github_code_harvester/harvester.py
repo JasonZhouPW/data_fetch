@@ -1,0 +1,822 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+LANGUAGES = ("Go", "Java", "Python", "JavaScript", "C++")
+SINCE_DATE = "2025-10-01"
+SOURCE_NAME = "GitHub"
+
+CODE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".hxx",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".py",
+}
+NON_CODE_EXACT = {
+    ".dockerignore",
+    ".editorconfig",
+    ".env",
+    ".env.example",
+    ".gitignore",
+    "go.mod",
+    "go.sum",
+    "package-lock.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pom.xml",
+    "requirements.txt",
+    "uv.lock",
+    "yarn.lock",
+}
+NON_CODE_DIRS = {
+    ".github",
+    "benchmarks",
+    "benchmark",
+    "docs",
+    "doc",
+    "examples",
+    "example",
+    "samples",
+    "sample",
+    "testdata",
+    "vendor",
+}
+EXCLUDED_REPO_TERMS = {
+    "awesome",
+    "course",
+    "demo",
+    "example",
+    "examples",
+    "generated",
+    "hands-on",
+    "learning",
+    "llm",
+    "sample",
+    "synthetic",
+    "template",
+    "tutorial",
+}
+MAX_FILE_BYTES = 512_000
+
+
+@dataclass(frozen=True)
+class RepoInfo:
+    full_name: str
+    clone_url: str
+    html_url: str
+    language: str
+    stargazers_count: int
+    description: str
+    topics: list[str]
+    pushed_at: str
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    sha: str
+    author: str
+    author_date: dt.datetime
+    changed_files: list[str]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch high-star GitHub projects and generate per-project JSONL code snapshots."
+    )
+    parser.add_argument("--output-dir", default="final_data", help="Directory for final per-repo JSONL files.")
+    parser.add_argument("--work-dir", default=".cache/github_repos", help="Directory for cloned repositories.")
+    parser.add_argument("--commit-work-dir", default=".cache/commit_json", help="Directory for intermediate commit JSON files.")
+    parser.add_argument("--repo-csv", default="group_repo.csv", help="CSV path for selected repositories.")
+    parser.add_argument("--refresh-repo-csv", action="store_true", help="Ignore an existing repo CSV and fetch a fresh repository list.")
+    parser.add_argument("--append-repo-csv", action="store_true", help="Fetch new repositories not already in repo CSV, append them, and process only the new repositories.")
+    parser.add_argument("--since", default=SINCE_DATE, help="Only read commits after this date, YYYY-MM-DD.")
+    parser.add_argument("--languages", nargs="+", default=list(LANGUAGES), help="GitHub languages to search.")
+    parser.add_argument("--min-stars", type=int, default=5_000, help="Minimum stars for repository candidates.")
+    parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate repositories per language.")
+    parser.add_argument("--target-repos", type=int, default=100, help="Target total repositories to collect.")
+    parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible repositories to process.")
+    parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
+    parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
+    parser.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN"), help="Optional GitHub token.")
+    parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
+    parser.add_argument("--repo", action="append", default=[], help="Process an explicit GitHub repo, e.g. owner/name.")
+    parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
+    return parser.parse_args(argv)
+
+
+def is_eligible_repo(repo: RepoInfo) -> bool:
+    if repo.stargazers_count <= 0:
+        return False
+    haystack = " ".join(
+        [repo.full_name, repo.description or "", " ".join(repo.topics or [])]
+    ).lower()
+    tokens = set(re.split(r"[^a-z0-9+]+", haystack))
+    if tokens & EXCLUDED_REPO_TERMS:
+        return False
+    return True
+
+
+def select_eligible_repos(
+    candidates: Iterable[RepoInfo],
+    max_repos: int | None = None,
+    seen: set[str] | None = None,
+) -> list[RepoInfo]:
+    selected: list[RepoInfo] = []
+    seen_names = seen if seen is not None else set()
+    for repo in candidates:
+        if repo.full_name in seen_names or not is_eligible_repo(repo):
+            continue
+        selected.append(repo)
+        seen_names.add(repo.full_name)
+        if max_repos is not None and len(selected) >= max_repos:
+            break
+    return selected
+
+
+def repo_author(repo: RepoInfo) -> str:
+    return repo.full_name.split("/", 1)[0]
+
+
+def repo_to_csv_row(repo: RepoInfo) -> dict[str, str]:
+    return {
+        "group_repo": repo.full_name,
+        "url": repo.html_url,
+        "language": repo.language,
+        "star": str(repo.stargazers_count),
+        "author": repo_author(repo),
+        "project_type": infer_project_type(repo),
+    }
+
+
+def write_repo_csv(repos: Sequence[RepoInfo], csv_path: Path) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["group_repo", "url", "language", "star", "author", "project_type"]
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        for repo in repos:
+            writer.writerow(repo_to_csv_row(repo))
+
+
+def append_repo_csv(repos: Sequence[RepoInfo], csv_path: Path) -> list[RepoInfo]:
+    existing = read_repo_csv(csv_path) if csv_path.exists() else []
+    seen = {repo.full_name for repo in existing}
+    appended: list[RepoInfo] = []
+    for repo in repos:
+        if repo.full_name in seen:
+            continue
+        appended.append(repo)
+        seen.add(repo.full_name)
+    write_repo_csv([*existing, *appended], csv_path)
+    return appended
+
+
+def filter_unprocessed_repos(repos: Sequence[RepoInfo], final_dir: Path) -> list[RepoInfo]:
+    return [
+        repo
+        for repo in repos
+        if not (final_dir / f"{safe_repo_name(repo.full_name)}.jsonl").exists()
+    ]
+
+
+def read_repo_csv(csv_path: Path) -> list[RepoInfo]:
+    repos: list[RepoInfo] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            full_name = (row.get("group_repo") or "").strip()
+            html_url = (row.get("url") or f"https://github.com/{full_name}").strip()
+            if not full_name:
+                continue
+            repos.append(
+                RepoInfo(
+                    full_name=full_name,
+                    clone_url=f"{html_url}.git",
+                    html_url=html_url,
+                    language=(row.get("language") or "unknown").strip(),
+                    stargazers_count=int(row.get("star") or 0),
+                    description="",
+                    topics=[],
+                    pushed_at="",
+                )
+            )
+    return repos
+
+
+def is_code_commit(
+    changed_files: Sequence[str],
+    code_extensions: set[str] = CODE_EXTENSIONS,
+) -> bool:
+    code_count = 0
+    non_code_count = 0
+    for file_name in changed_files:
+        if is_code_path(file_name, code_extensions):
+            code_count += 1
+        else:
+            non_code_count += 1
+    return code_count > 0 and code_count >= non_code_count
+
+
+def is_code_path(path: str, code_extensions: set[str] = CODE_EXTENSIONS) -> bool:
+    clean = path.strip()
+    if not clean:
+        return False
+    normalized = clean.replace("\\", "/")
+    parts = [part.lower() for part in normalized.split("/")]
+    if any(part in NON_CODE_DIRS for part in parts[:-1]):
+        return False
+    basename = parts[-1]
+    if basename in NON_CODE_EXACT:
+        return False
+    return Path(basename).suffix.lower() in code_extensions
+
+
+def infer_project_type(repo: RepoInfo, changed_files: Sequence[str] | None = None) -> str:
+    text = " ".join([repo.description or "", " ".join(repo.topics or []), repo.full_name]).lower()
+    files = " ".join(changed_files or []).lower()
+    combined = f"{text} {files}"
+    file_words = set(re.split(r"[^a-z0-9+]+", files))
+    words = set(re.split(r"[^a-z0-9+]+", combined))
+    if has_any_term(files, file_words, ("frontend", "react", "vue", "svelte", "ui", "web", "webapp")):
+        return "网站前端"
+    if has_any_term(files, file_words, ("backend", "server", "api", "database", "microservice", "proxy")):
+        return "网站后端"
+    if has_any_term(combined, words, ("frontend", "react", "vue", "svelte", "ui", "webapp")):
+        return "网站前端"
+    if has_any_term(combined, words, ("backend", "server", "api", "database", "microservice", "proxy")):
+        return "网站后端"
+    if has_any_term(combined, words, ("game", "unity", "engine")):
+        return "小游戏"
+    if has_any_term(combined, words, ("cli", "command-line", "terminal")):
+        return "命令行工具"
+    if has_any_term(combined, words, ("framework", "library", "sdk")):
+        return "开发库/框架"
+    if has_any_term(combined, words, ("model", "machine-learning", "ml", "ai")):
+        return "机器学习工程"
+    return "通用软件项目"
+
+
+def has_any_term(combined: str, words: set[str], terms: Sequence[str]) -> bool:
+    for term in terms:
+        if "-" in term:
+            if term in combined:
+                return True
+        elif term in words:
+            return True
+    return False
+
+
+def build_record(
+    repo: RepoInfo,
+    commit: CommitInfo,
+    text: str,
+    project_type: str,
+) -> dict:
+    return {
+        "id": commit.sha,
+        "text": text,
+        "meta": {
+            "data_info": {
+                "lang": repo.language,
+                "source": SOURCE_NAME,
+                "url": repo.html_url,
+                "type": "代码",
+                "author": commit.author,
+                "public_date": commit.author_date.isoformat(),
+                "project_type": project_type,
+            }
+        },
+    }
+
+
+def write_jsonl_for_commit(
+    repo_dir: Path,
+    output_path: Path,
+    repo: RepoInfo,
+    commit: CommitInfo,
+) -> int:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    code_parts: list[str] = []
+    code_paths: list[str] = []
+    for relative_path in commit.changed_files:
+        if not is_code_path(relative_path):
+            continue
+        file_path = repo_dir / relative_path
+        if not file_path.is_file() or file_path.stat().st_size > MAX_FILE_BYTES:
+            continue
+        try:
+            code_parts.append(file_path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            continue
+        code_paths.append(relative_path)
+    if not code_parts:
+        return 0
+    record = build_record(
+        repo=repo,
+        commit=commit,
+        text=merge_code_parts(code_parts),
+        project_type=infer_project_type(repo, code_paths),
+    )
+    with output_path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return 1
+
+
+def write_json_for_commit(
+    repo_dir: Path,
+    output_path: Path,
+    repo: RepoInfo,
+    commit: CommitInfo,
+) -> int:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    code_parts: list[str] = []
+    code_paths: list[str] = []
+    for relative_path in commit.changed_files:
+        if not is_code_path(relative_path):
+            continue
+        file_path = repo_dir / relative_path
+        if not file_path.is_file() or file_path.stat().st_size > MAX_FILE_BYTES:
+            continue
+        try:
+            code_parts.append(file_path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            continue
+        code_paths.append(relative_path)
+    if not code_parts:
+        return 0
+    record = build_record(
+        repo=repo,
+        commit=commit,
+        text=merge_code_parts(code_parts),
+        project_type=infer_project_type(repo, code_paths),
+    )
+    output_path.write_text(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return 1
+
+
+def merge_code_parts(code_parts: Sequence[str]) -> str:
+    return "\n\n".join(part.rstrip("\n") for part in code_parts) + "\n"
+
+
+def fetch_high_star_repos(
+    languages: Sequence[str],
+    min_stars: int,
+    repos_per_language: int,
+    github_token: str | None = None,
+    max_repos: int | None = None,
+    existing_repo_names: set[str] | None = None,
+) -> list[RepoInfo]:
+    repos: list[RepoInfo] = []
+    seen: set[str] = set(existing_repo_names or set())
+    for language in languages:
+        page = 1
+        language_selected = 0
+        while language_selected < repos_per_language and page <= 10:
+            query = f"language:{language} stars:>{min_stars} archived:false mirror:false"
+            params = urllib.parse.urlencode(
+                {
+                    "q": query,
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": min(100, max(10, repos_per_language * 3)),
+                    "page": page,
+                }
+            )
+            url = f"https://api.github.com/search/repositories?{params}"
+            payload = github_get_json(url, github_token)
+            items = payload.get("items", [])
+            if not items:
+                break
+            candidates = [
+                RepoInfo(
+                    full_name=item["full_name"],
+                    clone_url=item["clone_url"],
+                    html_url=item["html_url"],
+                    language=item.get("language") or language,
+                    stargazers_count=int(item.get("stargazers_count") or 0),
+                    description=item.get("description") or "",
+                    topics=list(item.get("topics") or []),
+                    pushed_at=item.get("pushed_at") or "",
+                )
+                for item in items
+            ]
+            remaining_for_language = repos_per_language - language_selected
+            remaining_total = None if max_repos is None else max_repos - len(repos)
+            limit = remaining_for_language
+            if remaining_total is not None:
+                limit = min(limit, remaining_total)
+            selected = select_eligible_repos(candidates, max_repos=limit, seen=seen)
+            repos.extend(selected)
+            language_selected += len(selected)
+            if max_repos is not None and len(repos) >= max_repos:
+                return repos
+            page += 1
+    return repos
+
+
+def fetch_repo(repo_name: str, github_token: str | None = None) -> RepoInfo:
+    encoded = urllib.parse.quote(repo_name.strip(), safe="/")
+    item = github_get_json(f"https://api.github.com/repos/{encoded}", github_token)
+    return RepoInfo(
+        full_name=item["full_name"],
+        clone_url=item["clone_url"],
+        html_url=item["html_url"],
+        language=item.get("language") or "unknown",
+        stargazers_count=int(item.get("stargazers_count") or 0),
+        description=item.get("description") or "",
+        topics=list(item.get("topics") or []),
+        pushed_at=item.get("pushed_at") or "",
+    )
+
+
+def github_get_json(url: str, github_token: str | None) -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-code-harvester",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def clone_or_update_repo(repo: RepoInfo, work_dir: Path, since: str | None = None) -> Path:
+    target = work_dir / safe_repo_name(repo.full_name)
+    if target.exists():
+        fetch_args = ["fetch", "--prune", "--tags"]
+        if since:
+            fetch_args.append(f"--shallow-since={since}")
+        try:
+            run_git(fetch_args, cwd=target)
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            return clone_or_update_repo(repo, work_dir, since=since)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        clone_args = ["clone"]
+        if since:
+            clone_args.append(f"--shallow-since={since}")
+        clone_args.extend([repo.clone_url, str(target)])
+        try:
+            run_git(clone_args, cwd=None)
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+    checkout_origin_head(target)
+    return target
+
+
+def list_commits_since(repo_dir: Path, since: str) -> list[str]:
+    output = run_git(
+        ["log", f"--since={since}", "--format=%H", "--no-merges"],
+        cwd=repo_dir,
+        capture=True,
+    )
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def get_commit_info(repo_dir: Path, sha: str) -> CommitInfo | None:
+    meta = run_git(["show", "-s", "--format=%an%x00%aI", sha], cwd=repo_dir, capture=True)
+    parts = meta.rstrip("\n").split("\x00")
+    if len(parts) != 2:
+        return None
+    files = run_git(
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+        cwd=repo_dir,
+        capture=True,
+    )
+    changed_files = [line.strip() for line in files.splitlines() if line.strip()]
+    if not changed_files:
+        return None
+    return CommitInfo(
+        sha=sha,
+        author=parts[0] or "unknown",
+        author_date=dt.datetime.fromisoformat(parts[1].replace("Z", "+00:00")),
+        changed_files=changed_files,
+    )
+
+
+def checkout_commit(repo_dir: Path, sha: str) -> None:
+    clean_git_worktree(repo_dir)
+    run_git(["checkout", "--force", "--quiet", sha], cwd=repo_dir)
+
+
+def checkout_origin_head(repo_dir: Path) -> None:
+    clean_git_worktree(repo_dir)
+    remote_head = run_git(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], cwd=repo_dir, capture=True)
+    branch = remote_head.strip()
+    if branch:
+        run_git(["checkout", "--force", "--quiet", branch], cwd=repo_dir)
+
+
+def clean_git_worktree(repo_dir: Path) -> None:
+    run_git(["reset", "--hard", "--quiet"], cwd=repo_dir)
+    run_git(["clean", "-fdx", "--quiet"], cwd=repo_dir)
+
+
+def process_repo(
+    repo: RepoInfo,
+    repo_dir: Path,
+    output_dir: Path,
+    since: str,
+    max_commits: int | None = None,
+) -> int:
+    output_path = output_dir / f"{safe_repo_name(repo.full_name)}.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    output_path.touch()
+    total = 0
+    processed_commits = 0
+    for sha in list_commits_since(repo_dir, since):
+        if max_commits is not None and processed_commits >= max_commits:
+            break
+        commit = get_commit_info(repo_dir, sha)
+        if commit is None or not is_code_commit(commit.changed_files):
+            continue
+        checkout_commit(repo_dir, commit.sha)
+        total += write_jsonl_for_commit(repo_dir, output_path, repo, commit)
+        processed_commits += 1
+    return total
+
+
+def process_repo_to_commit_jsons(
+    repo: RepoInfo,
+    repo_dir: Path,
+    commit_dir: Path,
+    since: str,
+    max_commits: int | None = None,
+) -> int:
+    if commit_dir.exists():
+        shutil.rmtree(commit_dir)
+    commit_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
+    processed_commits = 0
+    for sha in list_commits_since(repo_dir, since):
+        if max_commits is not None and processed_commits >= max_commits:
+            break
+        commit = get_commit_info(repo_dir, sha)
+        if commit is None or not is_code_commit(commit.changed_files):
+            continue
+        checkout_commit(repo_dir, commit.sha)
+        total += write_json_for_commit(
+            repo_dir=repo_dir,
+            output_path=commit_dir / f"{commit.sha}.json",
+            repo=repo,
+            commit=commit,
+        )
+        processed_commits += 1
+    return total
+
+
+def merge_commit_jsons_to_jsonl(commit_dir: Path, final_dir: Path, repo: RepoInfo) -> Path | None:
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_path = final_dir / f"{safe_repo_name(repo.full_name)}.jsonl"
+    commit_jsons = sorted(commit_dir.glob("*.json"))
+    if not commit_jsons:
+        final_path.unlink(missing_ok=True)
+        return None
+    with final_path.open("w", encoding="utf-8") as out:
+        for commit_json in commit_jsons:
+            text = commit_json.read_text(encoding="utf-8")
+            json.loads(text)
+            out.write(text + "\n")
+    return final_path
+
+
+def cleanup_project_workspace(repo_dir: Path, commit_dir: Path) -> None:
+    shutil.rmtree(repo_dir, ignore_errors=True)
+    shutil.rmtree(commit_dir, ignore_errors=True)
+
+
+def run_pipeline(
+    repos: Sequence[RepoInfo],
+    work_dir: Path,
+    output_dir: Path,
+    commit_work_dir: Path,
+    since: str,
+    jsonl_workers: int,
+    clone_workers: int = 1,
+    keep_repos: bool = False,
+    max_commits: int | None = None,
+) -> None:
+    original_count = len(repos)
+    repos = filter_unprocessed_repos(repos, output_dir)
+    skipped_count = original_count - len(repos)
+    if skipped_count:
+        print(f"Skipped {skipped_count} repositories already present in {output_dir}", flush=True)
+    if not repos:
+        print("No new repositories to process", flush=True)
+        return
+
+    clone_queue: queue.Queue[RepoInfo | None] = queue.Queue()
+    process_queue: queue.Queue[tuple[RepoInfo, Path] | None] = queue.Queue()
+    errors: list[tuple[str, str, str]] = []
+    error_lock = threading.Lock()
+
+    for repo in repos:
+        clone_queue.put(repo)
+    for _ in range(clone_workers):
+        clone_queue.put(None)
+
+    def record_error(repo: RepoInfo, stage: str, exc: Exception) -> None:
+        with error_lock:
+            errors.append((repo.full_name, stage, str(exc)))
+
+    def clone_worker() -> None:
+        while True:
+            repo = clone_queue.get()
+            try:
+                if repo is None:
+                    return
+                repo_dir = clone_or_update_repo(repo, work_dir, since=since)
+                process_queue.put((repo, repo_dir))
+            except Exception as exc:  # pragma: no cover - operational logging path
+                record_error(repo, "clone", exc)
+            finally:
+                clone_queue.task_done()
+
+    def process_worker() -> None:
+        while True:
+            item = process_queue.get()
+            try:
+                if item is None:
+                    return
+                repo, repo_dir = item
+                commit_dir = commit_work_dir / safe_repo_name(repo.full_name)
+                count = process_repo_to_commit_jsons(
+                    repo=repo,
+                    repo_dir=repo_dir,
+                    commit_dir=commit_dir,
+                    since=since,
+                    max_commits=max_commits,
+                )
+                final_path = merge_commit_jsons_to_jsonl(commit_dir, output_dir, repo)
+                if final_path is None:
+                    print(f"{repo.full_name}: wrote 0 records; no final jsonl created", flush=True)
+                else:
+                    print(f"{repo.full_name}: wrote {count} records", flush=True)
+                if keep_repos:
+                    shutil.rmtree(commit_dir, ignore_errors=True)
+                else:
+                    cleanup_project_workspace(repo_dir, commit_dir)
+            except Exception as exc:  # pragma: no cover - operational logging path
+                repo_name = item[0].full_name if item is not None else "unknown"
+                error_repo = item[0] if item is not None else RepoInfo(
+                    full_name=repo_name,
+                    clone_url="",
+                    html_url="",
+                    language="unknown",
+                    stargazers_count=0,
+                    description="",
+                    topics=[],
+                    pushed_at="",
+                )
+                record_error(error_repo, "process", exc)
+            finally:
+                process_queue.task_done()
+
+    clone_threads = [threading.Thread(target=clone_worker, daemon=True) for _ in range(clone_workers)]
+    process_threads = [threading.Thread(target=process_worker, daemon=True) for _ in range(jsonl_workers)]
+    for thread in clone_threads + process_threads:
+        thread.start()
+    clone_queue.join()
+    for _ in process_threads:
+        process_queue.put(None)
+    process_queue.join()
+    for thread in clone_threads + process_threads:
+        thread.join(timeout=1)
+    if errors:
+        write_failure_log(errors, output_dir)
+        print(f"{len(errors)} repositories failed; see {output_dir / 'failed_repos.log'}", flush=True)
+    if not keep_repos:
+        remove_empty_dir(work_dir)
+        remove_empty_dir(commit_work_dir)
+
+
+def write_failure_log(errors: Sequence[tuple[str, str, str]], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "failed_repos.log"
+    with path.open("a", encoding="utf-8") as fp:
+        for repo_name, stage, error in errors:
+            fp.write(f"{dt.datetime.now(dt.UTC).isoformat()}\t{repo_name}\t{stage}\t{error}\n")
+    return path
+
+
+def remove_empty_dir(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def run_git(args: Sequence[str], cwd: Path | None, capture: bool = False) -> str:
+    command = ["git", *args]
+    result = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+    return result.stdout if capture else ""
+
+
+def safe_repo_name(full_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "__", full_name)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    start = time.time()
+    repo_csv_path = Path(args.repo_csv)
+    if args.repo:
+        repos = [fetch_repo(repo_name, args.github_token) for repo_name in args.repo]
+    elif args.append_repo_csv:
+        existing = read_repo_csv(repo_csv_path) if repo_csv_path.exists() else []
+        existing_names = {repo.full_name for repo in existing}
+        target_new_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_repos(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            github_token=args.github_token,
+            max_repos=target_new_repos,
+            existing_repo_names=existing_names,
+        )
+        repos = append_repo_csv(repos, repo_csv_path)
+        print(
+            f"Appended {len(repos)} new repositories to {args.repo_csv}; existing count was {len(existing)}",
+            flush=True,
+        )
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} total repositories from {args.repo_csv}", flush=True)
+    elif repo_csv_path.exists() and not args.refresh_repo_csv:
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} repositories from {args.repo_csv}", flush=True)
+    else:
+        max_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_repos(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            github_token=args.github_token,
+            max_repos=max_repos,
+        )
+    print(f"Selected {len(repos)} repositories", flush=True)
+    if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
+        write_repo_csv(repos, repo_csv_path)
+        print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
+    run_pipeline(
+        repos=repos,
+        work_dir=Path(args.work_dir),
+        output_dir=Path(args.output_dir),
+        commit_work_dir=Path(args.commit_work_dir),
+        since=args.since,
+        jsonl_workers=max(1, args.workers),
+        clone_workers=max(1, args.clone_workers),
+        keep_repos=args.keep_repos,
+        max_commits=args.max_commits,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
