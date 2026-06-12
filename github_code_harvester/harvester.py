@@ -103,6 +103,7 @@ class RepoInfo:
     topics: list[str]
     pushed_at: str
     source: str = SOURCE_NAME
+    finished: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,12 +233,13 @@ def repo_to_csv_row(repo: RepoInfo) -> dict[str, str]:
         "star": str(repo.stargazers_count),
         "author": repo_author(repo),
         "project_type": infer_project_type(repo),
+        "finished": "true" if repo.finished else "false",
     }
 
 
 def write_repo_csv(repos: Sequence[RepoInfo], csv_path: Path) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["group_repo", "url", "language", "star", "author", "project_type"]
+    fieldnames = ["group_repo", "url", "language", "star", "author", "project_type", "finished"]
     with csv_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
@@ -258,12 +260,8 @@ def append_repo_csv(repos: Sequence[RepoInfo], csv_path: Path) -> list[RepoInfo]
     return appended
 
 
-def filter_unprocessed_repos(repos: Sequence[RepoInfo], final_dir: Path) -> list[RepoInfo]:
-    return [
-        repo
-        for repo in repos
-        if not (final_dir / f"{safe_repo_name(repo.full_name)}.jsonl").exists()
-    ]
+def filter_unfinished_repos(repos: Sequence[RepoInfo]) -> list[RepoInfo]:
+    return [repo for repo in repos if not repo.finished]
 
 
 def read_repo_csv(csv_path: Path) -> list[RepoInfo]:
@@ -286,9 +284,51 @@ def read_repo_csv(csv_path: Path) -> list[RepoInfo]:
                     topics=[],
                     pushed_at="",
                     source=infer_source_from_url(html_url),
+                    finished=parse_bool(row.get("finished")),
                 )
             )
     return repos
+
+
+def parse_bool(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def mark_repo_finished(csv_path: Path, repo_name: str) -> None:
+    if not csv_path.exists():
+        return
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if "finished" not in fieldnames:
+        fieldnames.append("finished")
+    for row in rows:
+        row.setdefault("finished", "false")
+        if (row.get("group_repo") or "").strip() == repo_name:
+            row["finished"] = "true"
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def ensure_repo_csv_finished_field(csv_path: Path) -> None:
+    if not csv_path.exists():
+        return
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if "finished" in fieldnames:
+        return
+    fieldnames.append("finished")
+    for row in rows:
+        row["finished"] = "false"
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def infer_source_from_url(url: str) -> str:
@@ -802,12 +842,13 @@ def run_pipeline(
     clone_workers: int = 1,
     keep_repos: bool = False,
     max_commits: int | None = None,
+    repo_csv_path: Path | None = None,
 ) -> None:
     original_count = len(repos)
-    repos = filter_unprocessed_repos(repos, output_dir)
+    repos = filter_unfinished_repos(repos)
     skipped_count = original_count - len(repos)
     if skipped_count:
-        print(f"Skipped {skipped_count} repositories already present in {output_dir}", flush=True)
+        print(f"Skipped {skipped_count} repositories already marked finished in CSV", flush=True)
     if not repos:
         print("No new repositories to process", flush=True)
         return
@@ -816,6 +857,7 @@ def run_pipeline(
     process_queue: queue.Queue[tuple[RepoInfo, Path] | None] = queue.Queue()
     errors: list[tuple[str, str, str]] = []
     error_lock = threading.Lock()
+    csv_lock = threading.Lock()
 
     for repo in repos:
         clone_queue.put(repo)
@@ -863,6 +905,9 @@ def run_pipeline(
                     shutil.rmtree(commit_dir, ignore_errors=True)
                 else:
                     cleanup_project_workspace(repo_dir, commit_dir)
+                if repo_csv_path is not None:
+                    with csv_lock:
+                        mark_repo_finished(repo_csv_path, repo.full_name)
             except Exception as exc:  # pragma: no cover - operational logging path
                 repo_name = item[0].full_name if item is not None else "unknown"
                 error_repo = item[0] if item is not None else RepoInfo(
@@ -972,6 +1017,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
         write_repo_csv(repos, repo_csv_path)
         print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
+    ensure_repo_csv_finished_field(repo_csv_path)
     run_pipeline(
         repos=repos,
         work_dir=Path(args.work_dir),
@@ -982,6 +1028,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         clone_workers=max(1, args.clone_workers),
         keep_repos=args.keep_repos,
         max_commits=args.max_commits,
+        repo_csv_path=repo_csv_path,
     )
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0
@@ -1038,6 +1085,7 @@ def gitlab_main(argv: Sequence[str] | None = None) -> int:
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
         write_repo_csv(repos, repo_csv_path)
         print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
+    ensure_repo_csv_finished_field(repo_csv_path)
     run_pipeline(
         repos=repos,
         work_dir=Path(args.work_dir),
@@ -1048,6 +1096,7 @@ def gitlab_main(argv: Sequence[str] | None = None) -> int:
         clone_workers=max(1, args.clone_workers),
         keep_repos=args.keep_repos,
         max_commits=args.max_commits,
+        repo_csv_path=repo_csv_path,
     )
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0

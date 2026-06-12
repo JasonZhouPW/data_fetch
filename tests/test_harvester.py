@@ -15,10 +15,12 @@ from github_code_harvester.harvester import (
     fetch_gitlab_project,
     fetch_high_star_gitlab_projects,
     gitlab_project_to_repo,
+    ensure_repo_csv_finished_field,
     is_code_commit,
     is_eligible_repo,
     infer_project_type,
     merge_commit_jsons_to_jsonl,
+    mark_repo_finished,
     process_repo,
     process_repo_to_commit_jsons,
     read_repo_csv,
@@ -27,7 +29,7 @@ from github_code_harvester.harvester import (
     run_pipeline,
     select_eligible_repos,
     append_repo_csv,
-    filter_unprocessed_repos,
+    filter_unfinished_repos,
     write_repo_csv,
     write_jsonl_for_commit,
 )
@@ -85,10 +87,11 @@ def test_repo_to_csv_row_and_write_repo_csv(tmp_path: Path):
         "star": "20000",
         "author": "owner",
         "project_type": "网站后端",
+        "finished": "false",
     }
     assert csv_path.read_text(encoding="utf-8").splitlines() == [
-        "group_repo,url,language,star,author,project_type",
-        "owner/production-api,https://github.com/owner/production-api,Go,20000,owner,网站后端",
+        "group_repo,url,language,star,author,project_type,finished",
+        "owner/production-api,https://github.com/owner/production-api,Go,20000,owner,网站后端,false",
     ]
 
 
@@ -112,6 +115,7 @@ def test_read_repo_csv_reconstructs_repo_info(tmp_path: Path):
             description="",
             topics=[],
             pushed_at="",
+            finished=False,
         )
     ]
 
@@ -155,9 +159,10 @@ def test_append_repo_csv_preserves_existing_and_appends_new_unique(tmp_path: Pat
     all_repos = read_repo_csv(csv_path)
     assert appended == [new_repo]
     assert [repo.full_name for repo in all_repos] == ["owner/existing", "owner/new"]
+    assert [repo.finished for repo in all_repos] == [False, False]
 
 
-def test_filter_unprocessed_repos_skips_existing_final_jsonl(tmp_path: Path):
+def test_filter_unfinished_repos_skips_finished_csv_records():
     done_repo = RepoInfo(
         full_name="owner/done",
         clone_url="https://github.com/owner/done.git",
@@ -167,6 +172,7 @@ def test_filter_unprocessed_repos_skips_existing_final_jsonl(tmp_path: Path):
         description="Done repo.",
         topics=[],
         pushed_at="",
+        finished=True,
     )
     pending_repo = RepoInfo(
         full_name="owner/pending",
@@ -178,11 +184,43 @@ def test_filter_unprocessed_repos_skips_existing_final_jsonl(tmp_path: Path):
         topics=[],
         pushed_at="",
     )
-    final_dir = tmp_path / "final_data"
-    final_dir.mkdir()
-    (final_dir / "owner__done.jsonl").write_text('{"id":"abc"}\n', encoding="utf-8")
 
-    assert filter_unprocessed_repos([done_repo, pending_repo], final_dir) == [pending_repo]
+    assert filter_unfinished_repos([done_repo, pending_repo]) == [pending_repo]
+
+
+def test_mark_repo_finished_updates_csv_without_touching_other_rows(tmp_path: Path):
+    csv_path = tmp_path / "group_repo.csv"
+    csv_path.write_text(
+        "group_repo,url,language,star,author,project_type,finished\n"
+        "owner/done,https://github.com/owner/done,Go,20000,owner,网站后端,false\n"
+        "owner/pending,https://github.com/owner/pending,Python,12000,owner,命令行工具,false\n",
+        encoding="utf-8",
+    )
+
+    mark_repo_finished(csv_path, "owner/done")
+
+    rows = csv_path.read_text(encoding="utf-8").splitlines()
+    assert rows == [
+        "group_repo,url,language,star,author,project_type,finished",
+        "owner/done,https://github.com/owner/done,Go,20000,owner,网站后端,true",
+        "owner/pending,https://github.com/owner/pending,Python,12000,owner,命令行工具,false",
+    ]
+
+
+def test_ensure_repo_csv_finished_field_adds_default_false_to_existing_csv(tmp_path: Path):
+    csv_path = tmp_path / "group_repo.csv"
+    csv_path.write_text(
+        "group_repo,url,language,star,author,project_type\n"
+        "owner/pending,https://github.com/owner/pending,Python,12000,owner,命令行工具\n",
+        encoding="utf-8",
+    )
+
+    ensure_repo_csv_finished_field(csv_path)
+
+    assert csv_path.read_text(encoding="utf-8").splitlines() == [
+        "group_repo,url,language,star,author,project_type,finished",
+        "owner/pending,https://github.com/owner/pending,Python,12000,owner,命令行工具,false",
+    ]
 
 
 def test_run_pipeline_records_failed_repo_without_raising(tmp_path: Path, monkeypatch):
@@ -216,6 +254,44 @@ def test_run_pipeline_records_failed_repo_without_raising(tmp_path: Path, monkey
     assert failure_log.exists()
     assert "owner/broken" in failure_log.read_text(encoding="utf-8")
     assert "network failed" in failure_log.read_text(encoding="utf-8")
+
+
+def test_run_pipeline_marks_repo_finished_after_success(tmp_path: Path, monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/done",
+        clone_url="https://github.com/owner/done.git",
+        html_url="https://github.com/owner/done",
+        language="Go",
+        stargazers_count=10_000,
+        description="Done repo.",
+        topics=[],
+        pushed_at="",
+    )
+    csv_path = tmp_path / "group_repo.csv"
+    write_repo_csv([repo], csv_path)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    monkeypatch.setattr(harvester, "clone_or_update_repo", lambda repo, work_dir, since=None: repo_dir)
+    monkeypatch.setattr(harvester, "process_repo_to_commit_jsons", lambda **kwargs: 1)
+    monkeypatch.setattr(
+        harvester,
+        "merge_commit_jsons_to_jsonl",
+        lambda commit_dir, final_dir, repo: final_dir / "owner__done.jsonl",
+    )
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data_github",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+        repo_csv_path=csv_path,
+    )
+
+    assert read_repo_csv(csv_path)[0].finished is True
 
 
 def test_select_eligible_repos_skips_filtered_candidates_until_limit():

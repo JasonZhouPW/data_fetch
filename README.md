@@ -41,8 +41,10 @@ group_repo.csv
 字段：
 
 ```text
-group_repo,url,language,star,author,project_type
+group_repo,url,language,star,author,project_type,finished
 ```
+
+新生成或新追加的 repo 的 `finished` 默认为 `false`。repo 处理成功后会自动回写为 `true`，处理失败则保持 `false`，方便下次继续重跑。
 
 如果 `group_repo.csv` 已存在，脚本会默认直接读取它并跳过 GitHub repo 搜索，避免重复生成清单。此时 `--languages`、`--min-stars`、`--repos-per-language`、`--target-repos` 和 `--max-repos` 不会改变已有 CSV 的语言分布；例如当前 CSV 只有 Go 项目时，即使命令里写了 `--languages Go Java Python JavaScript C++`，仍然只会处理 CSV 里的 Go 项目。
 
@@ -58,7 +60,7 @@ group_repo,url,language,star,author,project_type
 --append-repo-csv --languages Java Python JavaScript C++ --target-repos 100
 ```
 
-追加后脚本会读取完整 CSV 进入处理流程；已存在 `final_data/<group_repo>.jsonl` 的 repo 会自动跳过，所以不需要单独记录“本次新增列表”。
+追加后脚本会读取完整 CSV 进入处理流程；`finished=true` 的 repo 会自动跳过，`finished=false` 的 repo 会继续处理，所以不需要单独记录“本次新增列表”。
 
 ## 启动参数
 
@@ -69,7 +71,7 @@ group_repo,url,language,star,author,project_type
 | `--commit-work-dir` | `.cache/commit_json` | 每个 commit 中间 JSON 文件的工作目录。 |
 | `--repo-csv` | `group_repo.csv` | 仓库清单 CSV 路径。 |
 | `--refresh-repo-csv` | 关闭 | 忽略已存在的仓库清单，重新通过 GitHub Search API 搜索并写入 CSV。 |
-| `--append-repo-csv` | 关闭 | 在已有 CSV 后追加不重复的新仓库；追加后读取完整 CSV 处理，已生成 JSONL 的仓库会自动跳过。 |
+| `--append-repo-csv` | 关闭 | 在已有 CSV 后追加不重复的新仓库；追加后读取完整 CSV 处理，`finished=true` 的仓库会自动跳过。 |
 | `--since` | `2025-10-01` | 只读取该日期之后的 commit，格式为 `YYYY-MM-DD`。 |
 | `--languages` | `Go Java Python JavaScript C++` | GitHub Search API 的语言列表，空格分隔，例如 `--languages Python TypeScript`。 |
 | `--min-stars` | `5000` | 搜索候选仓库的最低 star 数。 |
@@ -113,7 +115,8 @@ final_data/owner__repo.jsonl
 - `--workers` 控制 commit JSON 生成线程池大小，默认 10。
 - 每个 commit 会先生成中间文件 `.cache/commit_json/<group_repo>/<commit_hash>.json`。
 - 一个 repo 的 commit 都处理完后，中间 JSON 合并为 `final_data/<group_repo>.jsonl`。
-- 启动处理前会检查 `final_data/<group_repo>.jsonl` 是否已存在；存在则跳过该 repo，不再 clone。
+- 启动处理前会检查 CSV 中对应 repo 的 `finished` 字段；`true` 则跳过该 repo，不再 clone，`false` 则继续处理。
+- repo 处理完成后会把 CSV 中对应记录的 `finished` 字段回写为 `true`；clone/fetch/process 失败则保持 `false`。
 - 默认会删除该 repo clone 目录和对应中间 commit JSON 目录；需要调试时可加 `--keep-repos`。
 - 单个 repo clone/fetch/process 失败不会终止整批任务；失败会追加记录到 `final_data/failed_repos.log`。
 - 如果已有 clone 目录 fetch 失败，脚本会删除该目录并重新 clone 一次。
@@ -129,8 +132,8 @@ python3 -m github_code_harvester \
   --commit-work-dir .cache/test_commit_json \
   --since 2025-10-01 \
   --max-commits 3 \
-  --clone-workers 1 \
-  --workers 1
+  --clone-workers 2 \
+  --workers 10
 ```
 
 ## GitLab 数据采集
