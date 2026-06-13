@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 import github_code_harvester.harvester as harvester
@@ -599,6 +600,39 @@ def test_fetch_high_star_gitlab_projects_searches_by_language_and_filters(monkey
     assert repos[0].source == "GitLab"
     assert "with_programming_language=Python" in calls[0]
     assert "order_by=star_count" in calls[0]
+
+
+def test_fetch_high_star_gitlab_projects_caps_api_page_size(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(url: str, token: str | None) -> list[dict]:
+        calls.append(url)
+        return [
+            {
+                "path_with_namespace": "group/service",
+                "http_url_to_repo": "https://gitlab.com/group/service.git",
+                "web_url": "https://gitlab.com/group/service",
+                "star_count": 8000,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            },
+        ]
+
+    monkeypatch.setattr(harvester, "gitlab_get_json", fake_get_json)
+
+    repos = fetch_high_star_gitlab_projects(
+        languages=["Go"],
+        min_stars=1000,
+        repos_per_language=100,
+        gitlab_base_url="https://gitlab.com",
+        gitlab_token=None,
+        max_repos=1,
+    )
+
+    assert len(repos) == 1
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)
+    assert query["per_page"] == ["10"]
 
 
 def test_write_jsonl_for_commit_writes_one_record_with_all_code(tmp_path: Path):

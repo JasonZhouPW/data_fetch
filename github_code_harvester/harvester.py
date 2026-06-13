@@ -24,6 +24,7 @@ SINCE_DATE = "2025-10-01"
 SOURCE_NAME = "GitHub"
 GITLAB_SOURCE_NAME = "GitLab"
 GITLAB_BASE_URL = "https://gitlab.com"
+GITLAB_PROJECTS_PER_PAGE = 10
 TOKEN_CONFIG_PATH = "token.json"
 
 CODE_EXTENSIONS = {
@@ -612,7 +613,7 @@ def fetch_high_star_gitlab_projects(
                     "order_by": "star_count",
                     "sort": "desc",
                     "simple": "true",
-                    "per_page": min(100, max(10, repos_per_language * 3)),
+                    "per_page": GITLAB_PROJECTS_PER_PAGE,
                     "page": page,
                     "with_programming_language": language,
                 }

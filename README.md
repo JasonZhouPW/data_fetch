@@ -142,6 +142,8 @@ python3 -m github_code_harvester \
 
 GitLab 的过滤要求与 GitHub 保持一致：项目 star 必须严格大于 `--min-stars`，排除 archived 和 mirror 项目，并继续使用名称、描述、topics 中的教学/示例/合成数据关键词过滤；commit 仍然复用同一套非 merge commit、代码文件比例、目录、文件类型和单文件大小过滤。
 
+GitLab 项目列表 API 对大分页请求有时会返回 `HTTP 500`，因此脚本会使用较小的固定页大小请求 GitLab；`--repos-per-language` 仍然表示每种语言最多收集的项目数量，脚本会通过翻页累积到目标数量。
+
 完整启动命令示例：
 
 ```bash
