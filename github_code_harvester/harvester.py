@@ -848,6 +848,41 @@ def fetch_gitlab_project(
     return gitlab_project_to_repo(item)
 
 
+def repo_has_commit_since_via_api(repo: RepoInfo, since: str) -> bool | None:
+    latest_commit_date = fetch_latest_commit_date_via_api(repo)
+    if latest_commit_date is None:
+        return None
+    since_date = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.UTC)
+    return latest_commit_date >= since_date
+
+
+def fetch_latest_commit_date_via_api(repo: RepoInfo) -> dt.datetime | None:
+    host = urllib.parse.urlparse(repo.html_url).netloc.lower()
+    if "github.com" in host:
+        github_token = resolve_token(None, "github", "GITHUB_TOKEN")
+        encoded = urllib.parse.quote(repo.full_name.strip(), safe="/")
+        payload = github_get_json(f"https://api.github.com/repos/{encoded}/commits?per_page=1", github_token)
+        if not isinstance(payload, list) or not payload:
+            return None
+        date_value = (((payload[0].get("commit") or {}).get("author") or {}).get("date"))
+        if not date_value:
+            return None
+        return dt.datetime.fromisoformat(date_value.replace("Z", "+00:00"))
+    if "gitlab" in host:
+        gitlab_token = os.getenv("GITLAB_TOKEN")
+        project_path = repo.full_name.strip()
+        encoded = urllib.parse.quote(project_path, safe="")
+        base_url = f"{urllib.parse.urlparse(repo.html_url).scheme}://{host}"
+        payload = gitlab_get_json(f"{base_url}/api/v4/projects/{encoded}/repository/commits?per_page=1", gitlab_token)
+        if not isinstance(payload, list) or not payload:
+            return None
+        date_value = payload[0].get("committed_date") or payload[0].get("created_at")
+        if not date_value:
+            return None
+        return dt.datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
+    return None
+
+
 def github_get_json(url: str, github_token: str | None) -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -1207,6 +1242,22 @@ def run_pipeline(
             try:
                 if repo is None:
                     return
+                try:
+                    has_recent_commit = repo_has_commit_since_via_api(repo, since)
+                except Exception as exc:
+                    has_recent_commit = None
+                    print(f"{repo.full_name}: API precheck failed ({exc}); continuing with clone", flush=True)
+                if has_recent_commit is False:
+                    print(f"{repo.full_name}: API precheck found no commits since {since}; skipping clone", flush=True)
+                    if repo_csv_path is not None:
+                        with csv_lock:
+                            mark_repo_finished(repo_csv_path, repo.full_name)
+                            remove_repos_from_failure_log(output_dir / "failed_repos.log", {repo.full_name})
+                    continue
+                if has_recent_commit is None:
+                    print(f"{repo.full_name}: API precheck unavailable; continuing with clone", flush=True)
+                else:
+                    print(f"{repo.full_name}: API precheck found recent commits since {since}", flush=True)
                 print(f"{repo.full_name}: clone start", flush=True)
                 repo_dir = clone_or_update_repo(repo, work_dir, since=since)
                 print(f"{repo.full_name}: clone done at {repo_dir}", flush=True)

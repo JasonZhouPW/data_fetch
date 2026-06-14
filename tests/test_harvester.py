@@ -41,6 +41,7 @@ from github_code_harvester.harvester import (
     write_repo_csv,
     write_jsonl_for_commit,
     parse_stackoverflow_args,
+    repo_has_commit_since_via_api,
     stackoverflow_question_to_record,
     write_stackoverflow_records,
 )
@@ -467,6 +468,167 @@ def test_run_pipeline_marks_repo_finished_when_no_qualifying_commits(tmp_path: P
     )
 
     assert read_repo_csv(csv_path)[0].finished is True
+
+
+def test_run_pipeline_skips_clone_when_api_latest_commit_is_before_since(tmp_path: Path, monkeypatch, capsys):
+    repo = RepoInfo(
+        full_name="owner/stale",
+        clone_url="https://github.com/owner/stale.git",
+        html_url="https://github.com/owner/stale",
+        language="Go",
+        stargazers_count=10_000,
+        description="Stale repo.",
+        topics=[],
+        pushed_at="",
+    )
+    csv_path = tmp_path / "group_repo.csv"
+    write_repo_csv([repo], csv_path)
+
+    monkeypatch.setattr(harvester, "repo_has_commit_since_via_api", lambda repo, since: False)
+    monkeypatch.setattr(harvester, "clone_or_update_repo", lambda repo, work_dir, since=None: pytest.fail("should not clone stale repo"))
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+        repo_csv_path=csv_path,
+    )
+
+    output = capsys.readouterr().out
+    assert "owner/stale: API precheck found no commits since 2025-10-01; skipping clone" in output
+    assert read_repo_csv(csv_path)[0].finished is True
+
+
+def test_run_pipeline_continues_clone_when_api_precheck_is_unknown(tmp_path: Path, monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/unknown",
+        clone_url="https://github.com/owner/unknown.git",
+        html_url="https://github.com/owner/unknown",
+        language="Go",
+        stargazers_count=10_000,
+        description="Repo with API failure.",
+        topics=[],
+        pushed_at="",
+    )
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    seen = {"cloned": False}
+
+    monkeypatch.setattr(harvester, "repo_has_commit_since_via_api", lambda repo, since: None)
+
+    def fake_clone(repo: RepoInfo, work_dir: Path, since: str | None = None) -> Path:
+        seen["cloned"] = True
+        return repo_dir
+
+    monkeypatch.setattr(harvester, "clone_or_update_repo", fake_clone)
+    monkeypatch.setattr(harvester, "list_commits_since", lambda repo_dir, since: [])
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+    )
+
+    assert seen["cloned"] is True
+
+
+def test_run_pipeline_logs_api_precheck_error_and_continues_clone(tmp_path: Path, monkeypatch, capsys):
+    repo = RepoInfo(
+        full_name="owner/rate-limited",
+        clone_url="https://github.com/owner/rate-limited.git",
+        html_url="https://github.com/owner/rate-limited",
+        language="Go",
+        stargazers_count=10_000,
+        description="Repo with API rate limit.",
+        topics=[],
+        pushed_at="",
+    )
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    seen = {"cloned": False}
+
+    def fail_precheck(repo: RepoInfo, since: str) -> bool | None:
+        raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+    def fake_clone(repo: RepoInfo, work_dir: Path, since: str | None = None) -> Path:
+        seen["cloned"] = True
+        return repo_dir
+
+    monkeypatch.setattr(harvester, "repo_has_commit_since_via_api", fail_precheck)
+    monkeypatch.setattr(harvester, "clone_or_update_repo", fake_clone)
+    monkeypatch.setattr(harvester, "list_commits_since", lambda repo_dir, since: [])
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+    )
+
+    output = capsys.readouterr().out
+    assert seen["cloned"] is True
+    assert "owner/rate-limited: API precheck failed (HTTP Error 429: Too Many Requests); continuing with clone" in output
+    assert not (tmp_path / "final_data" / "failed_repos.log").exists()
+
+
+def test_repo_has_commit_since_via_api_uses_latest_github_commit_date(monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/recent",
+        clone_url="https://github.com/owner/recent.git",
+        html_url="https://github.com/owner/recent",
+        language="Go",
+        stargazers_count=10_000,
+        description="Recent repo.",
+        topics=[],
+        pushed_at="",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_github_get_json(url: str, github_token: str | None) -> list[dict]:
+        seen["url"] = url
+        seen["token"] = github_token
+        return [{"commit": {"author": {"date": "2025-11-02T03:04:05Z"}}}]
+
+    monkeypatch.setattr(harvester, "github_get_json", fake_github_get_json)
+    monkeypatch.setattr(harvester, "resolve_token", lambda explicit, provider, env_name: "github-token")
+
+    assert repo_has_commit_since_via_api(repo, "2025-10-01") is True
+    assert seen == {
+        "url": "https://api.github.com/repos/owner/recent/commits?per_page=1",
+        "token": "github-token",
+    }
+
+
+def test_repo_has_commit_since_via_api_returns_false_for_stale_github_commit(monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/stale",
+        clone_url="https://github.com/owner/stale.git",
+        html_url="https://github.com/owner/stale",
+        language="Go",
+        stargazers_count=10_000,
+        description="Stale repo.",
+        topics=[],
+        pushed_at="",
+    )
+
+    monkeypatch.setattr(
+        harvester,
+        "github_get_json",
+        lambda url, github_token: [{"commit": {"author": {"date": "2025-07-16T19:42:23Z"}}}],
+    )
+
+    assert repo_has_commit_since_via_api(repo, "2025-10-01") is False
 
 
 def test_run_pipeline_marks_repo_finished_after_success(tmp_path: Path, monkeypatch):

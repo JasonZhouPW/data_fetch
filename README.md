@@ -119,6 +119,7 @@ final_data/owner__repo.jsonl
 - repo 处理完成后会把 CSV 中对应记录的 `finished` 字段回写为 `true`；clone/fetch/process 失败则保持 `false`。
 - 默认会删除该 repo clone 目录和对应中间 commit JSON 目录；需要调试时可加 `--keep-repos`。
 - 单个 repo clone/fetch/process 失败不会终止整批任务；失败会追加记录到 `final_data/failed_repos.log`。
+- 正常处理和失败记录重跑都会在 clone repo 之前先调用平台 API 查询默认分支最新 commit 时间；如果最新 commit 早于 `--since`，会跳过 clone，并在 CSV 中把该 repo 标记为 `finished=true`。如果 API 查询失败、返回 429、限流或返回不确定结果，只会打印日志并继续 clone，避免误跳过有效数据或中断任务。
 - 如果 shallow clone/fetch 出现 `fatal: error processing shallow info` 这类浅克隆错误，脚本会删除该 repo 缓存目录并自动 fallback 到普通完整 clone。
 - 如果已有 clone 目录 fetch 失败，脚本会删除该目录并重新 clone 一次。
 
@@ -157,6 +158,18 @@ owner/repo: process start
 owner/repo: found 12 commits since 2025-10-01
 owner/repo: commit scan summary scanned=12 metadata_missing=0 non_code=9 eligible=3 written=0 empty_records=3
 owner/repo: wrote 0 records; no final jsonl created
+```
+
+如果 clone 前 API 已经确认该 repo 没有 `--since` 之后的默认分支 commit，会看到：
+
+```text
+owner/repo: API precheck found no commits since 2025-10-01; skipping clone
+```
+
+如果 API 预检查被限流或出错，会继续 clone：
+
+```text
+owner/repo: API precheck failed (HTTP Error 429: Too Many Requests); continuing with clone
 ```
 
 如果 `found 0 commits`，说明该 repo 在 `--since` 之后没有非 merge commit；如果 `non_code` 很高，说明 commit 主要是文档、配置、依赖锁文件或其它非代码文件；如果 `eligible` 大于 0 但 `written=0`/`empty_records` 大于 0，说明 commit 通过了代码文件比例过滤，但实际 checkout 后可读取的代码文件为空、超大或编码不支持。
