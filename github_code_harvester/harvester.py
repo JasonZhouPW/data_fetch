@@ -390,9 +390,9 @@ def load_failed_repos_from_csv(csv_path: Path, failure_log: Path) -> list[RepoIn
         return []
     repos = read_repo_csv(csv_path)
     return [
-        replace(repo, finished=False)
+        repo
         for repo in repos
-        if repo.full_name in failed
+        if repo.full_name in failed and not repo.finished
     ]
 
 

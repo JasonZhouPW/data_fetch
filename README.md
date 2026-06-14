@@ -137,7 +137,9 @@ python3 -m failed_log_harvester \
   --workers 10
 ```
 
-该入口只读取 `failed_repos.log` 中出现的 repo，并从 CSV 中找到对应记录进行处理；不会简单地把原 CSV 里的记录批量改成 `finished=false`。失败 repo 后续处理成功后，会自动从 `failed_repos.log` 中移除对应历史失败记录。
+该入口只读取 `failed_repos.log` 中出现、且 CSV 里 `finished=false` 的 repo，并从 CSV 中找到对应记录进行处理；不会简单地把原 CSV 里的记录批量改成 `finished=false`。失败 repo 后续处理成功后，会自动从 `failed_repos.log` 中移除对应历史失败记录。
+
+如果某个 repo 能正常 clone 和扫描，但因为 `--since` 之后没有非 merge commit、没有代码 commit，或符合条件的 commit 最终没有可写入代码内容而生成 0 条 JSONL，该 repo 也会被视为处理完成并回写 `finished=true`。这样即使重启任务，脚本也不会反复处理这类已确认无数据的 repo。
 
 如果失败日志不在 `<output-dir>/failed_repos.log`，可显式指定：
 

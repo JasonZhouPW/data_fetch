@@ -5,6 +5,8 @@ import subprocess
 import urllib.parse
 from pathlib import Path
 
+import pytest
+
 import github_code_harvester.harvester as harvester
 from github_code_harvester.harvester import (
     CODE_EXTENSIONS,
@@ -244,17 +246,19 @@ def test_read_failed_repo_names_parses_unique_repo_names(tmp_path: Path):
     assert read_failed_repo_names(failure_log) == {"owner/one", "owner/two"}
 
 
-def test_load_failed_repos_from_csv_selects_only_failed_names_without_rewriting_csv(tmp_path: Path):
+def test_load_failed_repos_from_csv_selects_only_unfinished_failed_names_without_rewriting_csv(tmp_path: Path):
     csv_path = tmp_path / "group_repo.csv"
     csv_path.write_text(
         "group_repo,url,language,star,author,project_type,finished\n"
-        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true\n"
+        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,false\n"
+        "owner/already-done,https://github.com/owner/already-done,Go,20000,owner,网站后端,true\n"
         "owner/done,https://github.com/owner/done,Python,12000,owner,命令行工具,true\n",
         encoding="utf-8",
     )
     failure_log = tmp_path / "failed_repos.log"
     failure_log.write_text(
-        "2026-06-14T00:00:00+00:00\towner/failed\tclone\tnetwork failed\n",
+        "2026-06-14T00:00:00+00:00\towner/failed\tclone\tnetwork failed\n"
+        "2026-06-14T00:00:00+00:00\towner/already-done\tprocess\tno qualifying commits\n",
         encoding="utf-8",
     )
 
@@ -262,14 +266,14 @@ def test_load_failed_repos_from_csv_selects_only_failed_names_without_rewriting_
 
     assert [repo.full_name for repo in repos] == ["owner/failed"]
     assert repos[0].finished is False
-    assert "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true" in csv_path.read_text(encoding="utf-8")
+    assert "owner/already-done,https://github.com/owner/already-done,Go,20000,owner,网站后端,true" in csv_path.read_text(encoding="utf-8")
 
 
 def test_failed_log_main_processes_only_failed_repos_without_resetting_csv(tmp_path: Path, monkeypatch):
     csv_path = tmp_path / "group_repo.csv"
     csv_path.write_text(
         "group_repo,url,language,star,author,project_type,finished\n"
-        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true\n"
+        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,false\n"
         "owner/done,https://github.com/owner/done,Python,12000,owner,命令行工具,true\n",
         encoding="utf-8",
     )
@@ -305,7 +309,37 @@ def test_failed_log_main_processes_only_failed_repos_without_resetting_csv(tmp_p
     assert [repo.full_name for repo in repos] == ["owner/failed"]
     assert repos[0].finished is False
     assert seen["repo_csv_path"] == csv_path
-    assert read_repo_csv(csv_path)[0].finished is True
+    assert read_repo_csv(csv_path)[0].finished is False
+
+
+def test_failed_log_main_skips_failed_repos_already_marked_finished(tmp_path: Path, monkeypatch, capsys):
+    csv_path = tmp_path / "group_repo.csv"
+    csv_path.write_text(
+        "group_repo,url,language,star,author,project_type,finished\n"
+        "owner/no-commits,https://github.com/owner/no-commits,Go,20000,owner,网站后端,true\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "final_data"
+    output_dir.mkdir()
+    failure_log = output_dir / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/no-commits\tprocess\tno qualifying commits\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(harvester, "run_pipeline", lambda **kwargs: pytest.fail("should not run pipeline"))
+
+    assert failed_log_main(
+        [
+            "--repo-csv",
+            str(csv_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "Loaded 0 failed repositories" in output
+    assert "No failed repositories to process" in output
 
 
 def test_remove_repos_from_failure_log_deletes_successful_entries(tmp_path: Path):
@@ -400,6 +434,39 @@ def test_run_pipeline_logs_commit_scan_summary_when_no_jsonl(tmp_path: Path, mon
     assert "owner/no-code: found 1 commits since 2025-10-01" in output
     assert "owner/no-code: commit scan summary scanned=1 metadata_missing=0 non_code=1 eligible=0 written=0 empty_records=0" in output
     assert "owner/no-code: wrote 0 records; no final jsonl created" in output
+
+
+def test_run_pipeline_marks_repo_finished_when_no_qualifying_commits(tmp_path: Path, monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/no-commits",
+        clone_url="https://github.com/owner/no-commits.git",
+        html_url="https://github.com/owner/no-commits",
+        language="Go",
+        stargazers_count=10_000,
+        description="No recent commits.",
+        topics=[],
+        pushed_at="",
+    )
+    csv_path = tmp_path / "group_repo.csv"
+    write_repo_csv([repo], csv_path)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    monkeypatch.setattr(harvester, "clone_or_update_repo", lambda repo, work_dir, since=None: repo_dir)
+    monkeypatch.setattr(harvester, "list_commits_since", lambda repo_dir, since: [])
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+        repo_csv_path=csv_path,
+    )
+
+    assert read_repo_csv(csv_path)[0].finished is True
 
 
 def test_run_pipeline_marks_repo_finished_after_success(tmp_path: Path, monkeypatch):
