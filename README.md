@@ -211,3 +211,74 @@ GitLab 专用参数：
 | `--repo` | 空 | 指定 GitLab 项目路径，可重复传入，例如 `--repo group/project --repo group/subgroup/project`。 |
 
 其他参数与 GitHub 入口含义一致，包括 `--output-dir`、`--work-dir`、`--commit-work-dir`、`--repo-csv`、`--refresh-repo-csv`、`--append-repo-csv`、`--since`、`--languages`、`--min-stars`、`--repos-per-language`、`--target-repos`、`--max-repos`、`--workers`、`--clone-workers`、`--keep-repos` 和 `--max-commits`。
+
+## 技术讨论数据采集
+
+新增 `discussion_harvester` 入口，用于采集代码相关的技术问答和深度讨论数据。当前先支持 Stack Overflow，因为 Stack Exchange 提供官方 API，并且内容许可证清晰；Reddit 和 CSDN 暂不默认采集正文，原因是 API/版权限制更强，建议拿到授权后再接入。
+
+Stack Overflow 完整启动命令示例：
+
+```bash
+python3 -m discussion_harvester stackoverflow \
+  --output-dir final_data_stackoverflow \
+  --site stackoverflow \
+  --tags python java javascript go c++ \
+  --since 2024-01-01 \
+  --min-score 10 \
+  --min-answers 1 \
+  --max-records 50000 \
+  --max-answers 3 \
+  --page-size 100 \
+  --sleep-seconds 0.25
+```
+
+如果有 Stack Exchange API key，可在项目根目录 `token.json` 中增加：
+
+```json
+{
+  "github": "ghp_xxx",
+  "stackexchange": "stackexchange_key_xxx"
+}
+```
+
+也可以通过命令行显式传入：
+
+```bash
+--stackexchange-key stackexchange_key_xxx
+```
+
+Stack Overflow 参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--output-dir` | `final_data_stackoverflow` | Stack Overflow JSONL 输出目录。 |
+| `--site` | `stackoverflow` | Stack Exchange site 名称。 |
+| `--tags` | `python java javascript go c++` | 要采集的问题 tags，空格分隔。 |
+| `--since` | `2024-01-01` | 只采集该日期之后创建的问题，格式为 `YYYY-MM-DD`。 |
+| `--min-score` | `10` | 问题最低 score。 |
+| `--min-answers` | `1` | 问题最低 answer 数。 |
+| `--max-records` | `10000` | 本次最多写入的问题记录总数，跨所有 tags 计数。 |
+| `--max-answers` | `3` | 每个问题最多合并的高赞/accepted answers 数。 |
+| `--page-size` | `100` | Stack Exchange API 每页数量，脚本会限制在 1 到 100。 |
+| `--stackexchange-key` | `token.json` 的 `stackexchange` 字段，或环境变量 `STACKEXCHANGE_KEY` | 可选 Stack Exchange API key；命令行参数优先级最高。 |
+| `--sleep-seconds` | `0.25` | API 翻页之间的等待时间；如果 API 返回 `backoff`，优先按 `backoff` 等待。 |
+
+输出文件按 tag 分开，例如：
+
+```text
+final_data_stackoverflow/stackoverflow_python.jsonl
+```
+
+每行格式：
+
+```json
+{"id":"stackoverflow_question_123","text":"Title + Question + Accepted/high-score answers","meta":{"data_info":{"source":"StackOverflow","type":"技术问答","url":"https://stackoverflow.com/questions/123/...","license":"CC BY-SA 4.0","site":"stackoverflow","tag":"python","tags":["python","json"],"score":42,"views":9000,"answer_count":2,"author":"Question Author","public_date":"2024-01-01T00:00:00+00:00"}}}
+```
+
+采集策略：
+
+- 使用 Stack Exchange 官方 API 的 `/search/advanced` 拉取问题正文，再通过 `/questions/{ids}/answers` 拉取答案正文。
+- 问题按 votes 排序，筛选 `--since` 之后、score 不低于 `--min-score`、answer 数不低于 `--min-answers` 的记录。
+- 每个问题合并 title、question body，以及 accepted answer 或高赞 answers。
+- 不同 tag 命中的同一个 question 只写入一次，保留第一次命中的 tag。
+- Stack Overflow 内容许可证为 CC BY-SA，输出中保留 `url`、`author`、`license` 和 `public_date`，后续使用时仍需遵守 attribution 和 share-alike 要求。

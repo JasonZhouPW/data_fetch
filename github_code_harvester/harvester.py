@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import html as html_lib
 import json
 import os
 import queue
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -23,9 +25,12 @@ LANGUAGES = ("Go", "Java", "Python", "JavaScript", "C++")
 SINCE_DATE = "2025-10-01"
 SOURCE_NAME = "GitHub"
 GITLAB_SOURCE_NAME = "GitLab"
+STACKOVERFLOW_SOURCE_NAME = "StackOverflow"
 GITLAB_BASE_URL = "https://gitlab.com"
 GITLAB_PROJECTS_PER_PAGE = 10
 TOKEN_CONFIG_PATH = "token.json"
+STACKEXCHANGE_API_BASE_URL = "https://api.stackexchange.com/2.3"
+DISCUSSION_TAGS = ("python", "java", "javascript", "go", "c++")
 
 CODE_EXTENSIONS = {
     ".c",
@@ -180,6 +185,24 @@ def parse_failed_log_args(argv: Sequence[str] | None = None) -> argparse.Namespa
     parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
     parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
     parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
+    return parser.parse_args(argv)
+
+
+def parse_stackoverflow_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch high-quality Stack Overflow technical Q&A discussions as JSONL."
+    )
+    parser.add_argument("--output-dir", default="final_data_stackoverflow", help="Directory for Stack Overflow JSONL files.")
+    parser.add_argument("--site", default="stackoverflow", help="Stack Exchange site name.")
+    parser.add_argument("--tags", nargs="+", default=list(DISCUSSION_TAGS), help="Tags to collect, e.g. python java go.")
+    parser.add_argument("--since", default="2024-01-01", help="Only collect questions created after this date, YYYY-MM-DD.")
+    parser.add_argument("--min-score", type=int, default=10, help="Minimum question score.")
+    parser.add_argument("--min-answers", type=int, default=1, help="Minimum answer count.")
+    parser.add_argument("--max-records", type=int, default=10_000, help="Maximum records to write across all tags.")
+    parser.add_argument("--max-answers", type=int, default=3, help="Maximum answers included per question.")
+    parser.add_argument("--page-size", type=int, default=100, help="Stack Exchange API page size, capped at 100.")
+    parser.add_argument("--stackexchange-key", default=None, help="Optional Stack Exchange API key. Overrides token.json and STACKEXCHANGE_KEY.")
+    parser.add_argument("--sleep-seconds", type=float, default=0.25, help="Sleep between API pages.")
     return parser.parse_args(argv)
 
 
@@ -482,6 +505,115 @@ def build_record(
     }
 
 
+class StackOverflowHTMLTextParser(HTMLParser):
+    BLOCK_TAGS = {
+        "blockquote",
+        "br",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def text(self) -> str:
+        raw = html_lib.unescape("".join(self.parts))
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw.splitlines()]
+        return "\n".join(line for line in lines if line).strip()
+
+
+def html_to_text(value: str | None) -> str:
+    parser = StackOverflowHTMLTextParser()
+    parser.feed(value or "")
+    parser.close()
+    return parser.text()
+
+
+def unix_timestamp_to_iso(timestamp: int | float | None) -> str:
+    if timestamp is None:
+        return ""
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.UTC).isoformat()
+
+
+def stackoverflow_question_to_record(
+    question: dict,
+    tag: str,
+    max_answers: int = 3,
+    site: str = "stackoverflow",
+) -> dict:
+    question_id = question["question_id"]
+    answers = sorted(
+        question.get("answers") or [],
+        key=lambda item: (bool(item.get("is_accepted")), int(item.get("score") or 0)),
+        reverse=True,
+    )[:max(0, max_answers)]
+    text_parts = [
+        f"Title: {html_to_text(question.get('title'))}",
+        "",
+        f"Question:\n{html_to_text(question.get('body'))}",
+    ]
+    for index, answer in enumerate(answers, start=1):
+        label = "Accepted answer" if answer.get("is_accepted") else f"Answer {index}"
+        text_parts.extend(
+            [
+                "",
+                f"{label} (score: {int(answer.get('score') or 0)}):",
+                html_to_text(answer.get("body")),
+            ]
+        )
+    owner = question.get("owner") or {}
+    return {
+        "id": f"stackoverflow_question_{question_id}",
+        "text": "\n".join(part for part in text_parts if part is not None).strip() + "\n",
+        "meta": {
+            "data_info": {
+                "source": STACKOVERFLOW_SOURCE_NAME,
+                "type": "技术问答",
+                "url": question.get("link") or f"https://stackoverflow.com/questions/{question_id}",
+                "license": "CC BY-SA 4.0",
+                "site": site,
+                "tag": tag,
+                "tags": list(question.get("tags") or []),
+                "score": int(question.get("score") or 0),
+                "views": int(question.get("view_count") or 0),
+                "answer_count": int(question.get("answer_count") or 0),
+                "author": owner.get("display_name") or "unknown",
+                "public_date": unix_timestamp_to_iso(question.get("creation_date")),
+            }
+        },
+    }
+
+
+def write_stackoverflow_records(records: Sequence[dict], output_path: Path) -> int:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fp:
+        for record in records:
+            fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return len(records)
+
+
 def write_jsonl_for_commit(
     repo_dir: Path,
     output_path: Path,
@@ -739,6 +871,119 @@ def gitlab_get_json(url: str, gitlab_token: str | None) -> dict | list:
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def stackexchange_get_json(url: str) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "discussion-harvester",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def stackexchange_api_url(path: str, params: dict[str, object]) -> str:
+    clean = {
+        key: value
+        for key, value in params.items()
+        if value is not None and value != ""
+    }
+    return f"{STACKEXCHANGE_API_BASE_URL}{path}?{urllib.parse.urlencode(clean)}"
+
+
+def parse_since_timestamp(since: str) -> int:
+    parsed = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.UTC)
+    return int(parsed.timestamp())
+
+
+def fetch_stackoverflow_answers(
+    question_ids: Sequence[int],
+    site: str,
+    stackexchange_key: str | None = None,
+    page_size: int = 100,
+) -> dict[int, list[dict]]:
+    if not question_ids:
+        return {}
+    ids = ";".join(str(question_id) for question_id in question_ids)
+    url = stackexchange_api_url(
+        f"/questions/{ids}/answers",
+        {
+            "order": "desc",
+            "sort": "votes",
+            "site": site,
+            "pagesize": min(100, max(1, page_size)),
+            "filter": "withbody",
+            "key": stackexchange_key,
+        },
+    )
+    payload = stackexchange_get_json(url)
+    by_question: dict[int, list[dict]] = {}
+    for answer in payload.get("items") or []:
+        question_id = int(answer.get("question_id") or 0)
+        by_question.setdefault(question_id, []).append(answer)
+    if payload.get("backoff"):
+        time.sleep(float(payload["backoff"]))
+    return by_question
+
+
+def fetch_stackoverflow_questions_for_tag(
+    tag: str,
+    site: str,
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_records: int,
+    stackexchange_key: str | None = None,
+    page_size: int = 100,
+    sleep_seconds: float = 0.25,
+) -> list[dict]:
+    questions: list[dict] = []
+    page = 1
+    fromdate = parse_since_timestamp(since)
+    while len(questions) < max_records:
+        url = stackexchange_api_url(
+            "/search/advanced",
+            {
+                "order": "desc",
+                "sort": "votes",
+                "site": site,
+                "tagged": tag,
+                "fromdate": fromdate,
+                "min": min_score,
+                "answers": min_answers,
+                "pagesize": min(100, max(1, page_size)),
+                "page": page,
+                "filter": "withbody",
+                "key": stackexchange_key,
+            },
+        )
+        payload = stackexchange_get_json(url)
+        items = list(payload.get("items") or [])
+        if not items:
+            break
+        question_ids = [int(item["question_id"]) for item in items if item.get("question_id")]
+        answers_by_question = fetch_stackoverflow_answers(
+            question_ids=question_ids,
+            site=site,
+            stackexchange_key=stackexchange_key,
+            page_size=page_size,
+        )
+        for item in items:
+            item["answers"] = answers_by_question.get(int(item.get("question_id") or 0), [])
+            questions.append(item)
+            if len(questions) >= max_records:
+                break
+        if not payload.get("has_more"):
+            break
+        if payload.get("backoff"):
+            time.sleep(float(payload["backoff"]))
+        elif sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        page += 1
+    return questions
 
 
 def clone_or_update_repo(repo: RepoInfo, work_dir: Path, since: str | None = None) -> Path:
@@ -1190,6 +1435,54 @@ def failed_log_main(argv: Sequence[str] | None = None) -> int:
         max_commits=args.max_commits,
         repo_csv_path=repo_csv_path,
     )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def stackoverflow_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_stackoverflow_args(argv)
+    start = time.time()
+    output_dir = Path(args.output_dir)
+    stackexchange_key = resolve_token(args.stackexchange_key, "stackexchange", "STACKEXCHANGE_KEY")
+    remaining = max(0, args.max_records)
+    seen_questions: set[int] = set()
+    total_written = 0
+    for tag in args.tags:
+        if remaining <= 0:
+            break
+        questions = fetch_stackoverflow_questions_for_tag(
+            tag=tag,
+            site=args.site,
+            since=args.since,
+            min_score=args.min_score,
+            min_answers=args.min_answers,
+            max_records=remaining,
+            stackexchange_key=stackexchange_key,
+            page_size=args.page_size,
+            sleep_seconds=args.sleep_seconds,
+        )
+        records: list[dict] = []
+        for question in questions:
+            question_id = int(question.get("question_id") or 0)
+            if not question_id or question_id in seen_questions:
+                continue
+            seen_questions.add(question_id)
+            records.append(
+                stackoverflow_question_to_record(
+                    question,
+                    tag=tag,
+                    max_answers=args.max_answers,
+                    site=args.site,
+                )
+            )
+            remaining -= 1
+            if remaining <= 0:
+                break
+        output_path = output_dir / f"{args.site}_{safe_repo_name(tag)}.jsonl"
+        written = write_stackoverflow_records(records, output_path)
+        total_written += written
+        print(f"{tag}: wrote {written} records to {output_path}", flush=True)
+    print(f"Wrote {total_written} Stack Overflow records", flush=True)
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0
 

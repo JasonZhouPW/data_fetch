@@ -38,6 +38,9 @@ from github_code_harvester.harvester import (
     filter_unfinished_repos,
     write_repo_csv,
     write_jsonl_for_commit,
+    parse_stackoverflow_args,
+    stackoverflow_question_to_record,
+    write_stackoverflow_records,
 )
 
 
@@ -615,6 +618,89 @@ def test_resolve_token_reads_provider_field_from_token_json(tmp_path: Path, monk
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
     assert resolve_token(None, "github", "GITHUB_TOKEN", token_path) == "github-json-token"
+
+
+def test_parse_stackoverflow_args_sets_discussion_defaults():
+    args = parse_stackoverflow_args([])
+
+    assert args.output_dir == "final_data_stackoverflow"
+    assert args.site == "stackoverflow"
+    assert args.tags == ["python", "java", "javascript", "go", "c++"]
+    assert args.min_score == 10
+    assert args.min_answers == 1
+    assert args.page_size == 100
+
+
+def test_stackoverflow_question_to_record_combines_question_and_answers():
+    question = {
+        "question_id": 123,
+        "title": "How do I parse JSON safely?",
+        "body": "<p>I need to parse JSON in Python.</p><pre><code>json.loads(text)</code></pre>",
+        "link": "https://stackoverflow.com/questions/123/how-do-i-parse-json-safely",
+        "tags": ["python", "json"],
+        "score": 42,
+        "view_count": 9000,
+        "answer_count": 2,
+        "creation_date": 1_704_067_200,
+        "owner": {"display_name": "Question Author"},
+        "answers": [
+            {
+                "answer_id": 456,
+                "body": "<p>Use <code>json.loads</code> and catch the decode error.</p>",
+                "score": 81,
+                "is_accepted": True,
+                "creation_date": 1_704_067_260,
+                "owner": {"display_name": "Answer Author"},
+            },
+            {
+                "answer_id": 789,
+                "body": "<p>Validate the input first.</p>",
+                "score": 3,
+                "is_accepted": False,
+                "creation_date": 1_704_067_300,
+                "owner": {"display_name": "Other Author"},
+            },
+        ],
+    }
+
+    record = stackoverflow_question_to_record(question, tag="python", max_answers=1)
+
+    assert record["id"] == "stackoverflow_question_123"
+    assert "Title: How do I parse JSON safely?" in record["text"]
+    assert "Question:\nI need to parse JSON in Python." in record["text"]
+    assert "json.loads(text)" in record["text"]
+    assert "Accepted answer" in record["text"]
+    assert "Validate the input first" not in record["text"]
+    assert record["meta"]["data_info"] == {
+        "source": "StackOverflow",
+        "type": "技术问答",
+        "url": "https://stackoverflow.com/questions/123/how-do-i-parse-json-safely",
+        "license": "CC BY-SA 4.0",
+        "site": "stackoverflow",
+        "tag": "python",
+        "tags": ["python", "json"],
+        "score": 42,
+        "views": 9000,
+        "answer_count": 2,
+        "author": "Question Author",
+        "public_date": "2024-01-01T00:00:00+00:00",
+    }
+
+
+def test_write_stackoverflow_records_outputs_jsonl(tmp_path: Path):
+    output_path = tmp_path / "final_data_stackoverflow" / "stackoverflow_python.jsonl"
+    records = [
+        {
+            "id": "stackoverflow_question_1",
+            "text": "question and answer",
+            "meta": {"data_info": {"source": "StackOverflow"}},
+        }
+    ]
+
+    written = write_stackoverflow_records(records, output_path)
+
+    assert written == 1
+    assert json.loads(output_path.read_text(encoding="utf-8")) == records[0]
 
 
 def test_resolve_token_prefers_cli_value_then_falls_back_to_env(tmp_path: Path, monkeypatch):
