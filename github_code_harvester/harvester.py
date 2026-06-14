@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -162,6 +162,23 @@ def parse_gitlab_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gitlab-token", default=None, help="Optional GitLab token. GitLab does not read token.json by default.")
     parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
     parser.add_argument("--repo", action="append", default=[], help="Process an explicit GitLab project path, e.g. group/subgroup/project.")
+    parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
+    return parser.parse_args(argv)
+
+
+def parse_failed_log_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Retry only repositories listed in failed_repos.log."
+    )
+    parser.add_argument("--output-dir", default="final_data_github", help="Directory containing failed_repos.log and final JSONL files.")
+    parser.add_argument("--work-dir", default=".cache/github_repos", help="Directory for cloned repositories.")
+    parser.add_argument("--commit-work-dir", default=".cache/commit_json", help="Directory for intermediate commit JSON files.")
+    parser.add_argument("--repo-csv", default="group_repo.csv", help="CSV path for selected repositories.")
+    parser.add_argument("--failed-log", default=None, help="Path to failed_repos.log. Defaults to <output-dir>/failed_repos.log.")
+    parser.add_argument("--since", default=SINCE_DATE, help="Only read commits after this date, YYYY-MM-DD.")
+    parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
+    parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
+    parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
     parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
     return parser.parse_args(argv)
 
@@ -330,6 +347,46 @@ def ensure_repo_csv_finished_field(csv_path: Path) -> None:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def read_failed_repo_names(failure_log: Path) -> set[str]:
+    if not failure_log.exists():
+        return set()
+    failed: set[str] = set()
+    with failure_log.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1].strip():
+                failed.add(parts[1].strip())
+    return failed
+
+
+def load_failed_repos_from_csv(csv_path: Path, failure_log: Path) -> list[RepoInfo]:
+    failed = read_failed_repo_names(failure_log)
+    if not failed or not csv_path.exists():
+        return []
+    repos = read_repo_csv(csv_path)
+    return [
+        replace(repo, finished=False)
+        for repo in repos
+        if repo.full_name in failed
+    ]
+
+
+def remove_repos_from_failure_log(failure_log: Path, repo_names: set[str]) -> None:
+    if not repo_names or not failure_log.exists():
+        return
+    remaining: list[str] = []
+    with failure_log.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1].strip() in repo_names:
+                continue
+            remaining.append(line)
+    if remaining:
+        failure_log.write_text("".join(remaining), encoding="utf-8")
+    else:
+        failure_log.unlink()
 
 
 def infer_source_from_url(url: str) -> str:
@@ -694,7 +751,7 @@ def clone_or_update_repo(repo: RepoInfo, work_dir: Path, since: str | None = Non
             run_git(fetch_args, cwd=target)
         except Exception:
             shutil.rmtree(target, ignore_errors=True)
-            return clone_or_update_repo(repo, work_dir, since=since)
+            return clone_or_update_repo(repo, work_dir, since=None)
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
         clone_args = ["clone"]
@@ -705,6 +762,8 @@ def clone_or_update_repo(repo: RepoInfo, work_dir: Path, since: str | None = Non
             run_git(clone_args, cwd=None)
         except Exception:
             shutil.rmtree(target, ignore_errors=True)
+            if since:
+                return clone_or_update_repo(repo, work_dir, since=None)
             raise
     checkout_origin_head(target)
     return target
@@ -909,6 +968,7 @@ def run_pipeline(
                 if repo_csv_path is not None:
                     with csv_lock:
                         mark_repo_finished(repo_csv_path, repo.full_name)
+                        remove_repos_from_failure_log(output_dir / "failed_repos.log", {repo.full_name})
             except Exception as exc:  # pragma: no cover - operational logging path
                 repo_name = item[0].full_name if item is not None else "unknown"
                 error_repo = item[0] if item is not None else RepoInfo(
@@ -980,6 +1040,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     start = time.time()
     repo_csv_path = Path(args.repo_csv)
+    output_dir = Path(args.output_dir)
+    ensure_repo_csv_finished_field(repo_csv_path)
     github_token = resolve_token(args.github_token, "github", "GITHUB_TOKEN")
     if args.repo:
         repos = [fetch_repo(repo_name, github_token) for repo_name in args.repo]
@@ -1018,11 +1080,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
         write_repo_csv(repos, repo_csv_path)
         print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
-    ensure_repo_csv_finished_field(repo_csv_path)
     run_pipeline(
         repos=repos,
         work_dir=Path(args.work_dir),
-        output_dir=Path(args.output_dir),
+        output_dir=output_dir,
         commit_work_dir=Path(args.commit_work_dir),
         since=args.since,
         jsonl_workers=max(1, args.workers),
@@ -1039,6 +1100,8 @@ def gitlab_main(argv: Sequence[str] | None = None) -> int:
     args = parse_gitlab_args(argv)
     start = time.time()
     repo_csv_path = Path(args.repo_csv)
+    output_dir = Path(args.output_dir)
+    ensure_repo_csv_finished_field(repo_csv_path)
     gitlab_token = args.gitlab_token
     if args.repo:
         repos = [
@@ -1086,11 +1149,39 @@ def gitlab_main(argv: Sequence[str] | None = None) -> int:
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
         write_repo_csv(repos, repo_csv_path)
         print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
-    ensure_repo_csv_finished_field(repo_csv_path)
     run_pipeline(
         repos=repos,
         work_dir=Path(args.work_dir),
-        output_dir=Path(args.output_dir),
+        output_dir=output_dir,
+        commit_work_dir=Path(args.commit_work_dir),
+        since=args.since,
+        jsonl_workers=max(1, args.workers),
+        clone_workers=max(1, args.clone_workers),
+        keep_repos=args.keep_repos,
+        max_commits=args.max_commits,
+        repo_csv_path=repo_csv_path,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def failed_log_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_failed_log_args(argv)
+    start = time.time()
+    repo_csv_path = Path(args.repo_csv)
+    output_dir = Path(args.output_dir)
+    failure_log = Path(args.failed_log) if args.failed_log else output_dir / "failed_repos.log"
+    ensure_repo_csv_finished_field(repo_csv_path)
+    repos = load_failed_repos_from_csv(repo_csv_path, failure_log)
+    print(f"Loaded {len(repos)} failed repositories from {failure_log}", flush=True)
+    if not repos:
+        print("No failed repositories to process", flush=True)
+        print(f"Done in {time.time() - start:.1f}s", flush=True)
+        return 0
+    run_pipeline(
+        repos=repos,
+        work_dir=Path(args.work_dir),
+        output_dir=output_dir,
         commit_work_dir=Path(args.commit_work_dir),
         since=args.since,
         jsonl_workers=max(1, args.workers),

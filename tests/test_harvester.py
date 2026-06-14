@@ -12,7 +12,9 @@ from github_code_harvester.harvester import (
     RepoInfo,
     build_record,
     checkout_commit,
+    clone_or_update_repo,
     cleanup_project_workspace,
+    failed_log_main,
     fetch_gitlab_project,
     fetch_high_star_gitlab_projects,
     gitlab_project_to_repo,
@@ -20,12 +22,15 @@ from github_code_harvester.harvester import (
     is_code_commit,
     is_eligible_repo,
     infer_project_type,
+    load_failed_repos_from_csv,
+    read_failed_repo_names,
     merge_commit_jsons_to_jsonl,
     mark_repo_finished,
     process_repo,
     process_repo_to_commit_jsons,
     read_repo_csv,
     resolve_token,
+    remove_repos_from_failure_log,
     repo_to_csv_row,
     run_pipeline,
     select_eligible_repos,
@@ -224,6 +229,97 @@ def test_ensure_repo_csv_finished_field_adds_default_false_to_existing_csv(tmp_p
     ]
 
 
+def test_read_failed_repo_names_parses_unique_repo_names(tmp_path: Path):
+    failure_log = tmp_path / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/one\tclone\tnetwork failed\n"
+        "2026-06-14T00:01:00+00:00\towner/two\tprocess\tbad commit\n"
+        "2026-06-14T00:02:00+00:00\towner/one\tclone\tretry failed\n",
+        encoding="utf-8",
+    )
+
+    assert read_failed_repo_names(failure_log) == {"owner/one", "owner/two"}
+
+
+def test_load_failed_repos_from_csv_selects_only_failed_names_without_rewriting_csv(tmp_path: Path):
+    csv_path = tmp_path / "group_repo.csv"
+    csv_path.write_text(
+        "group_repo,url,language,star,author,project_type,finished\n"
+        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true\n"
+        "owner/done,https://github.com/owner/done,Python,12000,owner,命令行工具,true\n",
+        encoding="utf-8",
+    )
+    failure_log = tmp_path / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/failed\tclone\tnetwork failed\n",
+        encoding="utf-8",
+    )
+
+    repos = load_failed_repos_from_csv(csv_path, failure_log)
+
+    assert [repo.full_name for repo in repos] == ["owner/failed"]
+    assert repos[0].finished is False
+    assert "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true" in csv_path.read_text(encoding="utf-8")
+
+
+def test_failed_log_main_processes_only_failed_repos_without_resetting_csv(tmp_path: Path, monkeypatch):
+    csv_path = tmp_path / "group_repo.csv"
+    csv_path.write_text(
+        "group_repo,url,language,star,author,project_type,finished\n"
+        "owner/failed,https://github.com/owner/failed,Go,20000,owner,网站后端,true\n"
+        "owner/done,https://github.com/owner/done,Python,12000,owner,命令行工具,true\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "final_data"
+    output_dir.mkdir()
+    failure_log = output_dir / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/failed\tclone\tnetwork failed\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_run_pipeline(**kwargs):
+        seen["repos"] = kwargs["repos"]
+        seen["repo_csv_path"] = kwargs["repo_csv_path"]
+
+    monkeypatch.setattr(harvester, "run_pipeline", fake_run_pipeline)
+
+    assert failed_log_main(
+        [
+            "--repo-csv",
+            str(csv_path),
+            "--output-dir",
+            str(output_dir),
+            "--work-dir",
+            str(tmp_path / "repos"),
+            "--commit-work-dir",
+            str(tmp_path / "commit_json"),
+        ]
+    ) == 0
+
+    repos = seen["repos"]
+    assert [repo.full_name for repo in repos] == ["owner/failed"]
+    assert repos[0].finished is False
+    assert seen["repo_csv_path"] == csv_path
+    assert read_repo_csv(csv_path)[0].finished is True
+
+
+def test_remove_repos_from_failure_log_deletes_successful_entries(tmp_path: Path):
+    failure_log = tmp_path / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/recovered\tclone\tnetwork failed\n"
+        "2026-06-14T00:01:00+00:00\towner/still-broken\tprocess\tbad commit\n",
+        encoding="utf-8",
+    )
+
+    remove_repos_from_failure_log(failure_log, {"owner/recovered"})
+
+    assert failure_log.read_text(encoding="utf-8").splitlines() == [
+        "2026-06-14T00:01:00+00:00\towner/still-broken\tprocess\tbad commit",
+    ]
+
+
 def test_run_pipeline_records_failed_repo_without_raising(tmp_path: Path, monkeypatch):
     repo = RepoInfo(
         full_name="owner/broken",
@@ -293,6 +389,102 @@ def test_run_pipeline_marks_repo_finished_after_success(tmp_path: Path, monkeypa
     )
 
     assert read_repo_csv(csv_path)[0].finished is True
+
+
+def test_run_pipeline_removes_recovered_repo_from_failure_log(tmp_path: Path, monkeypatch):
+    recovered = RepoInfo(
+        full_name="owner/recovered",
+        clone_url="https://github.com/owner/recovered.git",
+        html_url="https://github.com/owner/recovered",
+        language="Go",
+        stargazers_count=10_000,
+        description="Recovered repo.",
+        topics=[],
+        pushed_at="",
+    )
+    still_broken = RepoInfo(
+        full_name="owner/still-broken",
+        clone_url="https://github.com/owner/still-broken.git",
+        html_url="https://github.com/owner/still-broken",
+        language="Go",
+        stargazers_count=10_000,
+        description="Still broken repo.",
+        topics=[],
+        pushed_at="",
+    )
+    csv_path = tmp_path / "group_repo.csv"
+    write_repo_csv([recovered, still_broken], csv_path)
+    output_dir = tmp_path / "final_data"
+    output_dir.mkdir()
+    failure_log = output_dir / "failed_repos.log"
+    failure_log.write_text(
+        "2026-06-14T00:00:00+00:00\towner/recovered\tclone\tnetwork failed\n"
+        "2026-06-14T00:01:00+00:00\towner/still-broken\tprocess\tbad commit\n",
+        encoding="utf-8",
+    )
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    monkeypatch.setattr(harvester, "clone_or_update_repo", lambda repo, work_dir, since=None: repo_dir)
+    monkeypatch.setattr(harvester, "process_repo_to_commit_jsons", lambda **kwargs: 1)
+    monkeypatch.setattr(
+        harvester,
+        "merge_commit_jsons_to_jsonl",
+        lambda commit_dir, final_dir, repo: final_dir / f"{repo.full_name.replace('/', '__')}.jsonl",
+    )
+
+    run_pipeline(
+        repos=[recovered],
+        work_dir=tmp_path / "repos",
+        output_dir=output_dir,
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+        repo_csv_path=csv_path,
+    )
+
+    assert failure_log.read_text(encoding="utf-8").splitlines() == [
+        "2026-06-14T00:01:00+00:00\towner/still-broken\tprocess\tbad commit",
+    ]
+
+
+def test_clone_or_update_repo_falls_back_to_full_clone_after_shallow_failure(tmp_path: Path, monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/project",
+        clone_url="https://github.com/owner/project.git",
+        html_url="https://github.com/owner/project",
+        language="Go",
+        stargazers_count=10_000,
+        description="Production service.",
+        topics=[],
+        pushed_at="",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_git(args, cwd, capture=False):
+        calls.append(list(args))
+        if args[:2] == ["clone", "--shallow-since=2025-10-01"]:
+            raise subprocess.CalledProcessError(128, ["git", *args], stderr="error processing shallow info: 4")
+        return "origin/main\n" if capture else ""
+
+    monkeypatch.setattr(harvester, "run_git", fake_run_git)
+    monkeypatch.setattr(harvester, "checkout_origin_head", lambda target: None)
+
+    target = clone_or_update_repo(repo, tmp_path / "repos", since="2025-10-01")
+
+    assert target == tmp_path / "repos" / "owner__project"
+    assert calls[0] == [
+        "clone",
+        "--shallow-since=2025-10-01",
+        "https://github.com/owner/project.git",
+        str(tmp_path / "repos" / "owner__project"),
+    ]
+    assert calls[1] == [
+        "clone",
+        "https://github.com/owner/project.git",
+        str(tmp_path / "repos" / "owner__project"),
+    ]
 
 
 def test_select_eligible_repos_skips_filtered_candidates_until_limit():

@@ -1,0 +1,7 @@
+*.csv
+*.py[cod]
+__pycache__/
+.DS_Store
+final_data*/
+token*.json
+tokens.txt

@@ -119,7 +119,31 @@ final_data/owner__repo.jsonl
 - repo 处理完成后会把 CSV 中对应记录的 `finished` 字段回写为 `true`；clone/fetch/process 失败则保持 `false`。
 - 默认会删除该 repo clone 目录和对应中间 commit JSON 目录；需要调试时可加 `--keep-repos`。
 - 单个 repo clone/fetch/process 失败不会终止整批任务；失败会追加记录到 `final_data/failed_repos.log`。
+- 如果 shallow clone/fetch 出现 `fatal: error processing shallow info` 这类浅克隆错误，脚本会删除该 repo 缓存目录并自动 fallback 到普通完整 clone。
 - 如果已有 clone 目录 fetch 失败，脚本会删除该目录并重新 clone 一次。
+
+## 失败记录重跑
+
+普通 GitHub/GitLab 入口不会根据 `failed_repos.log` 批量重置 CSV 状态。需要专门重跑失败记录时，使用独立入口：
+
+```bash
+python3 -m failed_log_harvester \
+  --repo-csv group_repo.csv \
+  --output-dir final_data_github \
+  --work-dir .cache/github_repos \
+  --commit-work-dir .cache/commit_json \
+  --since 2025-10-01 \
+  --clone-workers 1 \
+  --workers 10
+```
+
+该入口只读取 `failed_repos.log` 中出现的 repo，并从 CSV 中找到对应记录进行处理；不会简单地把原 CSV 里的记录批量改成 `finished=false`。失败 repo 后续处理成功后，会自动从 `failed_repos.log` 中移除对应历史失败记录。
+
+如果失败日志不在 `<output-dir>/failed_repos.log`，可显式指定：
+
+```bash
+--failed-log /path/to/failed_repos.log
+```
 
 ## 小样本测试
 
