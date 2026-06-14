@@ -356,6 +356,52 @@ def test_run_pipeline_records_failed_repo_without_raising(tmp_path: Path, monkey
     assert "network failed" in failure_log.read_text(encoding="utf-8")
 
 
+def test_run_pipeline_logs_commit_scan_summary_when_no_jsonl(tmp_path: Path, monkeypatch, capsys):
+    repo = RepoInfo(
+        full_name="owner/no-code",
+        clone_url="https://github.com/owner/no-code.git",
+        html_url="https://github.com/owner/no-code",
+        language="Python",
+        stargazers_count=10_000,
+        description="Docs only.",
+        topics=[],
+        pushed_at="",
+    )
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    monkeypatch.setattr(harvester, "clone_or_update_repo", lambda repo, work_dir, since=None: repo_dir)
+    monkeypatch.setattr(harvester, "list_commits_since", lambda repo_dir, since: ["abc123"])
+    monkeypatch.setattr(
+        harvester,
+        "get_commit_info",
+        lambda repo_dir, sha: CommitInfo(
+            sha=sha,
+            author="Docs Author",
+            author_date=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+            changed_files=["README.md"],
+        ),
+    )
+
+    run_pipeline(
+        repos=[repo],
+        work_dir=tmp_path / "repos",
+        output_dir=tmp_path / "final_data",
+        commit_work_dir=tmp_path / "commit_json",
+        since="2025-10-01",
+        jsonl_workers=1,
+        clone_workers=1,
+    )
+
+    output = capsys.readouterr().out
+    assert "Processing 1 repositories with clone_workers=1, workers=1, since=2025-10-01" in output
+    assert "owner/no-code: clone start" in output
+    assert "owner/no-code: clone done" in output
+    assert "owner/no-code: found 1 commits since 2025-10-01" in output
+    assert "owner/no-code: commit scan summary scanned=1 metadata_missing=0 non_code=1 eligible=0 written=0 empty_records=0" in output
+    assert "owner/no-code: wrote 0 records; no final jsonl created" in output
+
+
 def test_run_pipeline_marks_repo_finished_after_success(tmp_path: Path, monkeypatch):
     repo = RepoInfo(
         full_name="owner/done",

@@ -1100,20 +1100,43 @@ def process_repo_to_commit_jsons(
     commit_dir.mkdir(parents=True, exist_ok=True)
     total = 0
     processed_commits = 0
-    for sha in list_commits_since(repo_dir, since):
+    metadata_missing = 0
+    non_code_commits = 0
+    empty_records = 0
+    commits = list_commits_since(repo_dir, since)
+    print(f"{repo.full_name}: found {len(commits)} commits since {since}", flush=True)
+    for sha in commits:
         if max_commits is not None and processed_commits >= max_commits:
             break
         commit = get_commit_info(repo_dir, sha)
-        if commit is None or not is_code_commit(commit.changed_files):
+        if commit is None:
+            metadata_missing += 1
+            continue
+        if not is_code_commit(commit.changed_files):
+            non_code_commits += 1
             continue
         checkout_commit(repo_dir, commit.sha)
-        total += write_json_for_commit(
+        written = write_json_for_commit(
             repo_dir=repo_dir,
             output_path=commit_dir / f"{commit.sha}.json",
             repo=repo,
             commit=commit,
         )
+        if written:
+            total += written
+        else:
+            empty_records += 1
         processed_commits += 1
+    print(
+        f"{repo.full_name}: commit scan summary "
+        f"scanned={min(len(commits), max_commits) if max_commits is not None else len(commits)} "
+        f"metadata_missing={metadata_missing} "
+        f"non_code={non_code_commits} "
+        f"eligible={processed_commits} "
+        f"written={total} "
+        f"empty_records={empty_records}",
+        flush=True,
+    )
     return total
 
 
@@ -1157,6 +1180,11 @@ def run_pipeline(
     if not repos:
         print("No new repositories to process", flush=True)
         return
+    print(
+        f"Processing {len(repos)} repositories with "
+        f"clone_workers={max(1, clone_workers)}, workers={max(1, jsonl_workers)}, since={since}",
+        flush=True,
+    )
 
     clone_queue: queue.Queue[RepoInfo | None] = queue.Queue()
     process_queue: queue.Queue[tuple[RepoInfo, Path] | None] = queue.Queue()
@@ -1179,7 +1207,9 @@ def run_pipeline(
             try:
                 if repo is None:
                     return
+                print(f"{repo.full_name}: clone start", flush=True)
                 repo_dir = clone_or_update_repo(repo, work_dir, since=since)
+                print(f"{repo.full_name}: clone done at {repo_dir}", flush=True)
                 process_queue.put((repo, repo_dir))
             except Exception as exc:  # pragma: no cover - operational logging path
                 record_error(repo, "clone", exc)
@@ -1194,6 +1224,7 @@ def run_pipeline(
                     return
                 repo, repo_dir = item
                 commit_dir = commit_work_dir / safe_repo_name(repo.full_name)
+                print(f"{repo.full_name}: process start", flush=True)
                 count = process_repo_to_commit_jsons(
                     repo=repo,
                     repo_dir=repo_dir,
@@ -1205,7 +1236,7 @@ def run_pipeline(
                 if final_path is None:
                     print(f"{repo.full_name}: wrote 0 records; no final jsonl created", flush=True)
                 else:
-                    print(f"{repo.full_name}: wrote {count} records", flush=True)
+                    print(f"{repo.full_name}: wrote {count} records to {final_path}", flush=True)
                 if keep_repos:
                     shutil.rmtree(commit_dir, ignore_errors=True)
                 else:

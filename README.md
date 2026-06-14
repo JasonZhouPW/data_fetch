@@ -145,6 +145,20 @@ python3 -m failed_log_harvester \
 --failed-log /path/to/failed_repos.log
 ```
 
+重跑时会打印每个 repo 的诊断日志，用来判断为什么没有生成 JSONL：
+
+```text
+Processing 325 repositories with clone_workers=1, workers=10, since=2025-10-01
+owner/repo: clone start
+owner/repo: clone done at .cache/github_repos/owner__repo
+owner/repo: process start
+owner/repo: found 12 commits since 2025-10-01
+owner/repo: commit scan summary scanned=12 metadata_missing=0 non_code=9 eligible=3 written=0 empty_records=3
+owner/repo: wrote 0 records; no final jsonl created
+```
+
+如果 `found 0 commits`，说明该 repo 在 `--since` 之后没有非 merge commit；如果 `non_code` 很高，说明 commit 主要是文档、配置、依赖锁文件或其它非代码文件；如果 `eligible` 大于 0 但 `written=0`/`empty_records` 大于 0，说明 commit 通过了代码文件比例过滤，但实际 checkout 后可读取的代码文件为空、超大或编码不支持。
+
 ## 小样本测试
 
 ```bash
