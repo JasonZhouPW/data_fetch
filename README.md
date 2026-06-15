@@ -576,6 +576,43 @@ dump 参数：
 
 实现上会扫描 `Posts.xml` 两遍：第一遍从 checkpoint 记录的 question id 后继续顺序筛出符合条件的代码分析/解释类 question，第二遍只收集这些 question 的最高赞 answers，然后按批次写出 JSONL。每扫描 `--progress-interval` 行会打印当前扫描进度，每写完一个 JSONL 文件就更新 checkpoint。
 
+如果要先把超大的 `Posts.xml` 拆成可并行处理的小文件，可以使用专门的 question id 范围分片入口：
+
+```bash
+PYTHONPATH=. python3 -m discussion_harvester stackoverflow-dump-shard \
+  --posts-xml ../Posts.xml \
+  --shard-dir stackoverflow_dump_shards \
+  --shards 100 \
+  --progress-interval 100000
+```
+
+该命令会生成：
+
+```text
+stackoverflow_dump_shards/shard_000.jsonl
+stackoverflow_dump_shards/shard_001.jsonl
+...
+stackoverflow_dump_shards/shard_099.jsonl
+stackoverflow_dump_shards/manifest.json
+```
+
+分片规则：
+
+- question 按自己的 `Id` 所在范围写入对应 shard。
+- answer 不按自己的 `Id` 分片，而是按 `ParentId` 写入对应 question 的 shard。
+- 因此每个 shard 都包含该 question id 范围内的完整 `question + answers`，后续可以独立处理。
+
+如果不传 `--max-question-id`，命令会先扫描一次 `Posts.xml` 找最大 question id，再扫描一次写出 100 个 shard。若你已经知道最大 question id，可传 `--max-question-id` 跳过第一次扫描：
+
+```bash
+PYTHONPATH=. python3 -m discussion_harvester stackoverflow-dump-shard \
+  --posts-xml ../Posts.xml \
+  --shard-dir stackoverflow_dump_shards \
+  --shards 100 \
+  --max-question-id 80000000 \
+  --progress-interval 100000
+```
+
 CSDN 公开文章采集示例：
 
 ```bash

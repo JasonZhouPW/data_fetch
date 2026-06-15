@@ -50,9 +50,14 @@ from github_code_harvester.harvester import (
     write_jsonl_for_commit,
     parse_stackoverflow_args,
     parse_stackoverflow_dump_args,
+    parse_stackoverflow_dump_shard_args,
     public_article_to_record,
     read_stackoverflow_dump_checkpoint,
     repo_has_commit_since_via_api,
+    shard_stackoverflow_dump_by_question_range,
+    stackoverflow_dump_shard_bounds,
+    stackoverflow_dump_shard_main,
+    stackoverflow_dump_shard_path,
     stackoverflow_dump_is_code_analysis_question,
     stackoverflow_dump_main,
     stackoverflow_dump_question_to_record,
@@ -1162,6 +1167,24 @@ def test_parse_stackoverflow_dump_args_sets_streaming_defaults():
     assert args.progress_interval == 100_000
 
 
+def test_parse_stackoverflow_dump_shard_args_defaults_to_100_shards():
+    args = parse_stackoverflow_dump_shard_args(["--posts-xml", "Posts.xml"])
+
+    assert args.posts_xml == "Posts.xml"
+    assert args.shard_dir == "stackoverflow_dump_shards"
+    assert args.shards == 100
+    assert args.max_question_id == 0
+    assert args.progress_interval == 100_000
+
+
+def test_stackoverflow_dump_shard_bounds_cover_question_id_ranges():
+    assert stackoverflow_dump_shard_bounds(max_question_id=10, shard_count=3) == [
+        (1, 4),
+        (5, 8),
+        (9, 10),
+    ]
+
+
 def test_stackoverflow_dump_question_to_record_matches_api_shape():
     question = {
         "Id": "123",
@@ -1438,6 +1461,78 @@ def test_write_stackoverflow_dump_batches_prints_progress(tmp_path: Path, capsys
     assert "Posts.xml answer scan:" in output
     assert "Posts.xml question scan done:" in output
     assert "Posts.xml answer scan done:" in output
+
+
+def test_shard_stackoverflow_dump_groups_answers_by_parent_question_range(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="1" Title="Python one" Tags="&lt;python&gt;" Body="&lt;pre&gt;&lt;code&gt;print(one)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="6" PostTypeId="1" CreationDate="2024-02-02T00:00:00.000" Score="30" ViewCount="1000" AnswerCount="1" Title="Python six" Tags="&lt;python&gt;" Body="&lt;pre&gt;&lt;code&gt;print(six)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="20" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Answer one&lt;/p&gt;" />
+  <row Id="21" PostTypeId="2" ParentId="6" CreationDate="2024-02-02T00:02:00.000" Score="60" Body="&lt;p&gt;Answer six&lt;/p&gt;" />
+  <row Id="22" PostTypeId="5" CreationDate="2024-02-03T00:00:00.000" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    shard_dir = tmp_path / "shards"
+
+    manifest = shard_stackoverflow_dump_by_question_range(
+        posts_xml=posts_xml,
+        shard_dir=shard_dir,
+        shard_count=2,
+        max_question_id=10,
+        progress_interval=0,
+    )
+
+    first_rows = [
+        json.loads(line)
+        for line in stackoverflow_dump_shard_path(shard_dir, 0).read_text(encoding="utf-8").splitlines()
+    ]
+    second_rows = [
+        json.loads(line)
+        for line in stackoverflow_dump_shard_path(shard_dir, 1).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["Id"] for row in first_rows] == ["1", "20"]
+    assert [row["Id"] for row in second_rows] == ["6", "21"]
+    assert manifest["rows_written"] == 4
+    assert manifest["rows_skipped"] == 1
+    assert manifest["files"][0]["questions"] == 1
+    assert manifest["files"][0]["answers"] == 1
+    assert json.loads((shard_dir / "manifest.json").read_text(encoding="utf-8"))["shards"] == 2
+
+
+def test_stackoverflow_dump_shard_main_writes_manifest(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" Title="Python one" Tags="&lt;python&gt;" Body="&lt;pre&gt;&lt;code&gt;print(one)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Answer one&lt;/p&gt;" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    shard_dir = tmp_path / "shards"
+
+    assert stackoverflow_dump_shard_main(
+        [
+            "--posts-xml",
+            str(posts_xml),
+            "--shard-dir",
+            str(shard_dir),
+            "--shards",
+            "2",
+            "--progress-interval",
+            "0",
+        ]
+    ) == 0
+
+    assert (shard_dir / "manifest.json").exists()
+    assert stackoverflow_dump_shard_path(shard_dir, 0).exists()
+    assert stackoverflow_dump_shard_path(shard_dir, 1).exists()
 
 
 def test_extract_public_article_urls_filters_csdn_and_zhihu_shapes():

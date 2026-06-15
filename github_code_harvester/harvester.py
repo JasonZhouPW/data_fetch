@@ -332,6 +332,18 @@ def parse_stackoverflow_dump_args(argv: Sequence[str] | None = None) -> argparse
     return parser.parse_args(argv)
 
 
+def parse_stackoverflow_dump_shard_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Shard Stack Overflow Posts.xml into question-id range JSONL files."
+    )
+    parser.add_argument("--posts-xml", required=True, help="Path to Stack Overflow Posts.xml.")
+    parser.add_argument("--shard-dir", default="stackoverflow_dump_shards", help="Directory for shard JSONL files.")
+    parser.add_argument("--shards", type=int, default=100, help="Number of question-id range shards.")
+    parser.add_argument("--max-question-id", type=int, default=0, help="Known maximum question id. If omitted, scan Posts.xml once to discover it.")
+    parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed Posts.xml rows.")
+    return parser.parse_args(argv)
+
+
 def parse_public_article_args(source: str, argv: Sequence[str] | None = None) -> argparse.Namespace:
     source_label = CSDN_SOURCE_NAME if source == "csdn" else ZHIHU_SOURCE_NAME
     parser = argparse.ArgumentParser(
@@ -1065,6 +1077,155 @@ def iter_stackoverflow_post_rows(posts_xml: Path) -> Iterable[dict[str, str]]:
         if elem.tag == "row":
             yield dict(elem.attrib)
         elem.clear()
+
+
+def stackoverflow_dump_shard_path(shard_dir: Path, shard_index: int) -> Path:
+    return shard_dir / f"shard_{shard_index:03d}.jsonl"
+
+
+def stackoverflow_dump_shard_manifest_path(shard_dir: Path) -> Path:
+    return shard_dir / "manifest.json"
+
+
+def stackoverflow_dump_shard_bounds(max_question_id: int, shard_count: int) -> list[tuple[int, int]]:
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    max_id = max(1, max_question_id)
+    range_size = (max_id + shard_count - 1) // shard_count
+    bounds: list[tuple[int, int]] = []
+    for shard_index in range(shard_count):
+        start_id = shard_index * range_size + 1
+        end_id = min(max_id, (shard_index + 1) * range_size)
+        if start_id > max_id:
+            start_id = max_id + 1
+            end_id = max_id
+        bounds.append((start_id, end_id))
+    return bounds
+
+
+def stackoverflow_question_id_to_shard(question_id: int, max_question_id: int, shard_count: int) -> int:
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if question_id < 1:
+        return 0
+    range_size = (max(1, max_question_id) + shard_count - 1) // shard_count
+    return min(shard_count - 1, (question_id - 1) // max(1, range_size))
+
+
+def find_stackoverflow_dump_max_question_id(
+    posts_xml: Path,
+    progress_interval: int = 100_000,
+) -> int:
+    max_question_id = 0
+    scanned_rows = 0
+    scanned_questions = 0
+    for row in iter_stackoverflow_post_rows(posts_xml):
+        scanned_rows += 1
+        if progress_interval > 0 and scanned_rows % progress_interval == 0:
+            print(
+                f"Posts.xml max question scan: rows={scanned_rows} questions={scanned_questions} max_question_id={max_question_id}",
+                flush=True,
+            )
+        if row.get("PostTypeId") != "1":
+            continue
+        scanned_questions += 1
+        question_id = int(row.get("Id") or 0)
+        if question_id > max_question_id:
+            max_question_id = question_id
+    print(
+        f"Posts.xml max question scan done: rows={scanned_rows} questions={scanned_questions} max_question_id={max_question_id}",
+        flush=True,
+    )
+    return max_question_id
+
+
+def shard_stackoverflow_dump_by_question_range(
+    posts_xml: Path,
+    shard_dir: Path,
+    shard_count: int = 100,
+    max_question_id: int = 0,
+    progress_interval: int = 100_000,
+) -> dict:
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if max_question_id <= 0:
+        max_question_id = find_stackoverflow_dump_max_question_id(
+            posts_xml,
+            progress_interval=progress_interval,
+        )
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    bounds = stackoverflow_dump_shard_bounds(max_question_id, shard_count)
+    shard_counts = [
+        {
+            "shard": shard_index,
+            "path": stackoverflow_dump_shard_path(shard_dir, shard_index).name,
+            "question_id_start": start_id,
+            "question_id_end": end_id,
+            "questions": 0,
+            "answers": 0,
+            "rows": 0,
+        }
+        for shard_index, (start_id, end_id) in enumerate(bounds)
+    ]
+    handles = [
+        stackoverflow_dump_shard_path(shard_dir, shard_index).open("w", encoding="utf-8")
+        for shard_index in range(shard_count)
+    ]
+    scanned_rows = 0
+    written_rows = 0
+    skipped_rows = 0
+    try:
+        for row in iter_stackoverflow_post_rows(posts_xml):
+            scanned_rows += 1
+            if progress_interval > 0 and scanned_rows % progress_interval == 0:
+                print(
+                    f"Posts.xml shard write: rows={scanned_rows} written={written_rows} skipped={skipped_rows}",
+                    flush=True,
+                )
+            post_type = row.get("PostTypeId")
+            if post_type == "1":
+                question_id = int(row.get("Id") or 0)
+                count_key = "questions"
+            elif post_type == "2":
+                question_id = int(row.get("ParentId") or 0)
+                count_key = "answers"
+            else:
+                skipped_rows += 1
+                continue
+            if question_id < 1:
+                skipped_rows += 1
+                continue
+            shard_index = stackoverflow_question_id_to_shard(
+                question_id,
+                max_question_id=max_question_id,
+                shard_count=shard_count,
+            )
+            handles[shard_index].write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            shard_counts[shard_index][count_key] += 1
+            shard_counts[shard_index]["rows"] += 1
+            written_rows += 1
+    finally:
+        for handle in handles:
+            handle.close()
+    manifest = {
+        "source": str(posts_xml),
+        "shards": shard_count,
+        "max_question_id": max_question_id,
+        "rows_scanned": scanned_rows,
+        "rows_written": written_rows,
+        "rows_skipped": skipped_rows,
+        "files": shard_counts,
+    }
+    stackoverflow_dump_shard_manifest_path(shard_dir).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"Posts.xml shard write done: rows={scanned_rows} written={written_rows} skipped={skipped_rows} shards={shard_count}",
+        flush=True,
+    )
+    print(f"Shard manifest: {stackoverflow_dump_shard_manifest_path(shard_dir)}", flush=True)
+    return manifest
 
 
 def select_stackoverflow_dump_questions(
@@ -2650,6 +2811,24 @@ def stackoverflow_dump_main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Wrote {written} Stack Overflow dump records to {output_dir}", flush=True)
     print(f"Checkpoint: {checkpoint_file}", flush=True)
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def stackoverflow_dump_shard_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_stackoverflow_dump_shard_args(argv)
+    start = time.time()
+    manifest = shard_stackoverflow_dump_by_question_range(
+        posts_xml=Path(args.posts_xml),
+        shard_dir=Path(args.shard_dir),
+        shard_count=args.shards,
+        max_question_id=args.max_question_id,
+        progress_interval=args.progress_interval,
+    )
+    print(
+        f"Wrote {manifest['rows_written']} Stack Overflow dump rows into {manifest['shards']} shards under {args.shard_dir}",
+        flush=True,
+    )
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0
 
