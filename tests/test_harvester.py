@@ -17,6 +17,7 @@ from github_code_harvester.harvester import (
     clone_or_update_repo,
     cleanup_project_workspace,
     failed_log_main,
+    fetch_high_star_repos,
     fetch_gitlab_project,
     fetch_high_star_gitlab_projects,
     gitlab_project_to_repo,
@@ -172,6 +173,57 @@ def test_append_repo_csv_preserves_existing_and_appends_new_unique(tmp_path: Pat
     assert appended == [new_repo]
     assert [repo.full_name for repo in all_repos] == ["owner/existing", "owner/new"]
     assert [repo.finished for repo in all_repos] == [False, False]
+
+
+def test_fetch_high_star_repos_skips_existing_and_continues_pages(monkeypatch):
+    calls: list[str] = []
+
+    def fake_github_get_json(url: str, github_token: str | None) -> dict:
+        calls.append(url)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if query.get("page") == ["1"]:
+            return {
+                "items": [
+                    {
+                        "full_name": "owner/existing",
+                        "clone_url": "https://github.com/owner/existing.git",
+                        "html_url": "https://github.com/owner/existing",
+                        "language": "Go",
+                        "stargazers_count": 20_000,
+                        "description": "Existing production server.",
+                        "topics": ["server"],
+                        "pushed_at": "",
+                    }
+                ]
+            }
+        return {
+            "items": [
+                {
+                    "full_name": "owner/new",
+                    "clone_url": "https://github.com/owner/new.git",
+                    "html_url": "https://github.com/owner/new",
+                    "language": "Go",
+                    "stargazers_count": 15_000,
+                    "description": "New production server.",
+                    "topics": ["server"],
+                    "pushed_at": "",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(harvester, "github_get_json", fake_github_get_json)
+
+    repos = fetch_high_star_repos(
+        languages=["Go"],
+        min_stars=5_000,
+        repos_per_language=1,
+        max_repos=1,
+        existing_repo_names={"owner/existing"},
+        search_max_pages=2,
+    )
+
+    assert [repo.full_name for repo in repos] == ["owner/new"]
+    assert len(calls) == 2
 
 
 def test_filter_unfinished_repos_skips_finished_csv_records():
@@ -1186,6 +1238,41 @@ def test_fetch_high_star_gitlab_projects_caps_api_page_size(monkeypatch):
     assert len(repos) == 1
     query = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)
     assert query["per_page"] == ["10"]
+
+
+def test_fetch_high_star_gitlab_projects_continues_beyond_ten_pages_when_needed(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(url: str, token: str | None) -> list[dict]:
+        calls.append(url)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        page = int(query["page"][0])
+        return [
+            {
+                "path_with_namespace": f"group/service-{page}",
+                "http_url_to_repo": f"https://gitlab.com/group/service-{page}.git",
+                "web_url": f"https://gitlab.com/group/service-{page}",
+                "star_count": 8000 - page,
+                "description": "Production backend service.",
+                "topics": ["api"],
+                "last_activity_at": "2026-01-02T03:04:05Z",
+            }
+        ]
+
+    monkeypatch.setattr(harvester, "gitlab_get_json", fake_get_json)
+
+    repos = fetch_high_star_gitlab_projects(
+        languages=["Go"],
+        min_stars=1000,
+        repos_per_language=11,
+        gitlab_base_url="https://gitlab.com",
+        gitlab_token=None,
+        max_repos=11,
+    )
+
+    assert len(repos) == 11
+    assert repos[-1].full_name == "group/service-11"
+    assert len(calls) == 11
 
 
 def test_write_jsonl_for_commit_writes_one_record_with_all_code(tmp_path: Path):

@@ -57,10 +57,11 @@ group_repo,url,language,star,author,project_type,finished
 如果要在已有 `group_repo.csv` 后面继续追加 100 个不重复 repo，例如补充 Java、Python、JavaScript、C++，加：
 
 ```bash
---append-repo-csv --languages Java Python JavaScript C++ --target-repos 100
+--append-repo-csv --languages Java Python JavaScript C++ --target-repos 100 --search-max-pages 10
 ```
 
 追加后脚本会读取完整 CSV 进入处理流程；`finished=true` 的 repo 会自动跳过，`finished=false` 的 repo 会继续处理，所以不需要单独记录“本次新增列表”。
+追加搜索会把 CSV 里已有 repo 当作排重集合；遇到重复会继续翻页查询，尽量直到新增数量达到 `--target-repos`。如果扫描到 `--search-max-pages` 仍不足，会打印 warning。
 
 ## 启动参数
 
@@ -78,6 +79,7 @@ group_repo,url,language,star,author,project_type,finished
 | `--repos-per-language` | `100` | 每种语言最多选取的候选仓库数量。 |
 | `--target-repos` | `100` | 目标仓库总数；当未设置 `--max-repos` 时生效。 |
 | `--max-repos` | 不限制 | 最大可处理仓库数；用于搜索或追加时会覆盖 `--target-repos`。 |
+| `--search-max-pages` | `10` | GitHub 搜索每种语言最多向后翻页数；追加 CSV 时用于跳过已有 repo 后继续寻找新 repo。 |
 | `--workers` | `10` | commit JSON 生成线程数，实际最小值为 1。 |
 | `--clone-workers` | `1` | clone/fetch 线程数，实际最小值为 1。 |
 | `--github-token` | `token.json` 的 `github` 字段，或环境变量 `GITHUB_TOKEN` | GitHub API token；命令行参数优先级最高。 |
@@ -196,6 +198,8 @@ python3 -m github_code_harvester \
 GitLab 的过滤要求与 GitHub 保持一致：项目 star 必须严格大于 `--min-stars`，排除 archived 和 mirror 项目，并继续使用名称、描述、topics 中的教学/示例/合成数据关键词过滤；commit 仍然复用同一套非 merge commit、代码文件比例、目录、文件类型和单文件大小过滤。
 
 GitLab 项目列表 API 对大分页请求有时会返回 `HTTP 500`，因此脚本会使用较小的固定页大小请求 GitLab；`--repos-per-language` 仍然表示每种语言最多收集的项目数量，脚本会通过翻页累积到目标数量。
+
+使用 `--append-repo-csv` 时，脚本会从 GitLab 搜索结果中跳过 CSV 里已存在的项目，并继续向后翻页寻找新的项目。GitLab 每页仍固定请求 10 条，以降低 GitLab 500 风险；每种语言最多翻到 `min(100, max(10, --repos-per-language))` 页。如果前面的高星项目都已存在、低于 `--min-stars`、archived/mirror，或被教学/示例过滤，追加数量可能小于目标值。
 
 完整启动命令示例：
 

@@ -28,6 +28,7 @@ GITLAB_SOURCE_NAME = "GitLab"
 STACKOVERFLOW_SOURCE_NAME = "StackOverflow"
 GITLAB_BASE_URL = "https://gitlab.com"
 GITLAB_PROJECTS_PER_PAGE = 10
+GITLAB_MAX_SEARCH_PAGES = 100
 TOKEN_CONFIG_PATH = "token.json"
 STACKEXCHANGE_API_BASE_URL = "https://api.stackexchange.com/2.3"
 DISCUSSION_TAGS = ("python", "java", "javascript", "go", "c++")
@@ -136,6 +137,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate repositories per language.")
     parser.add_argument("--target-repos", type=int, default=100, help="Target total repositories to collect.")
     parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible repositories to process.")
+    parser.add_argument("--search-max-pages", type=int, default=10, help="Maximum GitHub Search API pages to scan per language while looking for new repositories.")
     parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
     parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
     parser.add_argument("--github-token", default=None, help="Optional GitHub token. Overrides token.json and GITHUB_TOKEN.")
@@ -693,13 +695,14 @@ def fetch_high_star_repos(
     github_token: str | None = None,
     max_repos: int | None = None,
     existing_repo_names: set[str] | None = None,
+    search_max_pages: int = 10,
 ) -> list[RepoInfo]:
     repos: list[RepoInfo] = []
     seen: set[str] = set(existing_repo_names or set())
     for language in languages:
         page = 1
         language_selected = 0
-        while language_selected < repos_per_language and page <= 10:
+        while language_selected < repos_per_language and page <= max(1, search_max_pages):
             query = f"language:{language} stars:>{min_stars} archived:false mirror:false"
             params = urllib.parse.urlencode(
                 {
@@ -794,7 +797,11 @@ def fetch_high_star_gitlab_projects(
     for language in languages:
         page = 1
         language_selected = 0
-        while language_selected < repos_per_language and page <= 10:
+        max_pages = min(
+            GITLAB_MAX_SEARCH_PAGES,
+            max(10, repos_per_language),
+        )
+        while language_selected < repos_per_language and page <= max_pages:
             params = urllib.parse.urlencode(
                 {
                     "visibility": "public",
@@ -809,6 +816,8 @@ def fetch_high_star_gitlab_projects(
             )
             payload = gitlab_get_json(f"{base_url}/api/v4/projects?{params}", gitlab_token)
             if not isinstance(payload, list) or not payload:
+                break
+            if max((int(item.get("star_count") or 0) for item in payload), default=0) <= min_stars:
                 break
             candidates = [
                 gitlab_project_to_repo(item, language=language)
@@ -1383,12 +1392,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             github_token=github_token,
             max_repos=target_new_repos,
             existing_repo_names=existing_names,
+            search_max_pages=args.search_max_pages,
         )
         repos = append_repo_csv(repos, repo_csv_path)
         print(
             f"Appended {len(repos)} new repositories to {args.repo_csv}; existing count was {len(existing)}",
             flush=True,
         )
+        if len(repos) < target_new_repos:
+            print(
+                f"Warning: requested {target_new_repos} new repositories, but only found {len(repos)} after scanning up to {args.search_max_pages} pages per language.",
+                flush=True,
+            )
         repos = read_repo_csv(repo_csv_path)
         print(f"Loaded {len(repos)} total repositories from {args.repo_csv}", flush=True)
     elif repo_csv_path.exists() and not args.refresh_repo_csv:
@@ -1402,6 +1417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repos_per_language=args.repos_per_language,
             github_token=github_token,
             max_repos=max_repos,
+            search_max_pages=args.search_max_pages,
         )
     print(f"Selected {len(repos)} repositories", flush=True)
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
