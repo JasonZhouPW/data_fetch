@@ -60,6 +60,12 @@ group_repo,url,language,star,author,project_type,finished
 --append-repo-csv --languages Java Python JavaScript C++ --target-repos 100 --search-max-pages 10
 ```
 
+如果想在满足 `--min-stars` 的候选里按 star 从低到高搜索，加：
+
+```bash
+--star-order asc
+```
+
 追加后脚本会读取完整 CSV 进入处理流程；`finished=true` 的 repo 会自动跳过，`finished=false` 的 repo 会继续处理，所以不需要单独记录“本次新增列表”。
 追加搜索会把 CSV 里已有 repo 当作排重集合；遇到重复会继续翻页查询，尽量直到新增数量达到 `--target-repos`。如果扫描到 `--search-max-pages` 仍不足，会打印 warning。
 
@@ -79,6 +85,7 @@ group_repo,url,language,star,author,project_type,finished
 | `--repos-per-language` | `100` | 每种语言最多选取的候选仓库数量。 |
 | `--target-repos` | `100` | 目标仓库总数；当未设置 `--max-repos` 时生效。 |
 | `--max-repos` | 不限制 | 最大可处理仓库数；用于搜索或追加时会覆盖 `--target-repos`。 |
+| `--star-order` | `desc` | GitHub star 排序方向，`desc` 为高到低，`asc` 为低到高。 |
 | `--search-max-pages` | `10` | GitHub 搜索每种语言最多向后翻页数；追加 CSV 时用于跳过已有 repo 后继续寻找新 repo。 |
 | `--workers` | `10` | commit JSON 生成线程数，实际最小值为 1。 |
 | `--clone-workers` | `1` | clone/fetch 线程数，实际最小值为 1。 |
@@ -306,6 +313,49 @@ Gitee 专用参数：
 | `--repo` | 空 | 指定 Gitee 项目路径，可重复传入，例如 `--repo owner/project --repo group/project`。 |
 
 其他参数与 GitHub/GitLab 入口含义一致。
+
+## 漏洞 Patch Pair 数据采集
+
+新增 `vuln_patch_harvester` 入口，用于把已确认来源的 CVE/NVD、厂商公告、CTF、反汇编分析 seed 转换为漏洞修复前后代码对照数据。第一版不做全网漏洞搜索，而是要求输入 curated seed JSONL：每条 seed 明确修复 commit、触发代码和可选汇编注释，脚本负责从 Git 仓库抽取 vulnerable/fixed/diff patch pair。
+
+seed JSONL 示例：
+
+```json
+{"id":"CVE-2099-0001","source":"NVD","commit_url":"https://github.com/owner/project/commit/abc123","language":"C","cwe":["CWE-787"],"severity":"HIGH","description":"Buffer overflow in parser.","trigger_code":"parse(payload);","assembly":{"arch":"x86_64","disassembly":"call parse","comments":"触发路径进入未检查边界的 copy 调用"},"license":"MIT","url":"https://nvd.nist.gov/vuln/detail/CVE-2099-0001"}
+```
+
+也可以不用 `commit_url`，显式提供：
+
+```json
+{"id":"CTF-foo-001","source":"CTF","clone_url":"https://github.com/owner/project.git","html_url":"https://github.com/owner/project","fix_commit":"abc123","trigger_code":"./solve.py","assembly":{"comments":"main+0x42 比较输入长度"}}
+```
+
+运行命令：
+
+```bash
+python3 -m vuln_patch_harvester \
+  --seed-jsonl vuln_seeds.jsonl \
+  --output-dir final_data_vuln_patch \
+  --work-dir .cache/vuln_patch_repos \
+  --require-trigger \
+  --max-records 1000
+```
+
+输出文件：
+
+```text
+final_data_vuln_patch/vuln_patch_pairs.jsonl
+```
+
+每条记录包含：
+
+- `code.vulnerable`：修复 commit 的父提交中的漏洞代码。
+- `code.fixed`：修复 commit 中的修复代码。
+- `code.diff`：对应文件的 Git diff。
+- `trigger.code`：seed 中提供的漏洞触发代码、PoC、fuzz input 或 CTF 输入。
+- `assembly`：seed 中提供的反汇编代码和注释。
+
+注意：脚本不会自动执行 PoC，也不会验证攻击效果；`trigger.safe_to_run` 固定写为 `false`。这类数据建议只使用公开授权来源，并保留 `license` 和 `url`。
 
 ## 技术讨论数据采集
 

@@ -265,6 +265,29 @@ def test_fetch_high_star_repos_caps_github_search_pages(monkeypatch):
     assert calls == list(range(1, 11))
 
 
+def test_fetch_high_star_repos_accepts_ascending_star_order(monkeypatch):
+    calls: list[str] = []
+
+    def fake_github_get_json(url: str, github_token: str | None) -> dict:
+        calls.append(url)
+        return {"items": []}
+
+    monkeypatch.setattr(harvester, "github_get_json", fake_github_get_json)
+
+    repos = fetch_high_star_repos(
+        languages=["Go"],
+        min_stars=5_000,
+        repos_per_language=1,
+        search_max_pages=1,
+        star_order="asc",
+    )
+
+    assert repos == []
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)
+    assert query["sort"] == ["stars"]
+    assert query["order"] == ["asc"]
+
+
 def test_filter_unfinished_repos_skips_finished_csv_records():
     done_repo = RepoInfo(
         full_name="owner/done",

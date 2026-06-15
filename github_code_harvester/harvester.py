@@ -143,6 +143,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate repositories per language.")
     parser.add_argument("--target-repos", type=int, default=100, help="Target total repositories to collect.")
     parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible repositories to process.")
+    parser.add_argument("--star-order", choices=("asc", "desc"), default="desc", help="GitHub star sort order for repository search.")
     parser.add_argument(
         "--search-max-pages",
         type=int,
@@ -735,6 +736,7 @@ def fetch_high_star_repos(
     max_repos: int | None = None,
     existing_repo_names: set[str] | None = None,
     search_max_pages: int = 10,
+    star_order: str = "desc",
 ) -> list[RepoInfo]:
     repos: list[RepoInfo] = []
     seen: set[str] = set(existing_repo_names or set())
@@ -748,7 +750,7 @@ def fetch_high_star_repos(
                 {
                     "q": query,
                     "sort": "stars",
-                    "order": "desc",
+                    "order": star_order,
                     "per_page": min(100, max(10, repos_per_language * 3)),
                     "page": page,
                 }
@@ -1683,6 +1685,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_repos=target_new_repos,
             existing_repo_names=existing_names,
             search_max_pages=args.search_max_pages,
+            star_order=args.star_order,
         )
         repos = append_repo_csv(repos, repo_csv_path)
         print(
@@ -1709,6 +1712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             github_token=github_token,
             max_repos=max_repos,
             search_max_pages=args.search_max_pages,
+            star_order=args.star_order,
         )
     print(f"Selected {len(repos)} repositories", flush=True)
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
