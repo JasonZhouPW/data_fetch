@@ -12,8 +12,11 @@ from github_code_harvester.harvester import (
     CODE_EXTENSIONS,
     CommitInfo,
     RepoInfo,
+    anonymize_record,
+    anonymize_text,
     build_record,
     checkout_commit,
+    collect_public_article_records,
     clone_or_update_repo,
     cleanup_project_workspace,
     failed_log_main,
@@ -42,11 +45,21 @@ from github_code_harvester.harvester import (
     select_eligible_repos,
     append_repo_csv,
     filter_unfinished_repos,
+    extract_public_article_urls,
     write_repo_csv,
     write_jsonl_for_commit,
     parse_stackoverflow_args,
+    parse_stackoverflow_dump_args,
+    public_article_to_record,
+    read_stackoverflow_dump_checkpoint,
     repo_has_commit_since_via_api,
+    stackoverflow_dump_is_code_analysis_question,
+    stackoverflow_dump_main,
+    stackoverflow_dump_question_to_record,
     stackoverflow_question_to_record,
+    stackoverflow_dump_output_path,
+    write_stackoverflow_dump_batches,
+    write_stackoverflow_dump_jsonl,
     write_stackoverflow_records,
 )
 
@@ -930,6 +943,49 @@ def test_project_type_does_not_treat_ui_substrings_as_frontend():
     assert infer_project_type(repo, ["server/http/controller_v2.go"]) == "网站后端"
 
 
+def test_anonymize_text_replaces_unique_identifiers_with_lowercase_x():
+    text = (
+        "email alice@example.com phone +1 415-555-2671 mobile 13800138000 "
+        "ssn 123-45-6789 card 4111 1111 1111 1111 "
+        "出生日期: 1990-01-02 微信号: alice_wx 地址: 北京市海淀区1号"
+    )
+
+    anonymized = anonymize_text(text)
+
+    assert "alice@example.com" not in anonymized
+    assert "+1 415-555-2671" not in anonymized
+    assert "13800138000" not in anonymized
+    assert "123-45-6789" not in anonymized
+    assert "4111 1111 1111 1111" not in anonymized
+    assert "1990-01-02" not in anonymized
+    assert "alice_wx" not in anonymized
+    assert "北京市海淀区1号" not in anonymized
+    assert set(anonymized) >= {"x"}
+
+
+def test_anonymize_record_preserves_source_url_but_masks_text_and_author():
+    record = {
+        "id": "abc123",
+        "text": "contact me at alice@example.com or 13800138000",
+        "meta": {
+            "data_info": {
+                "source": "GitHub",
+                "url": "https://github.com/owner/project",
+                "author": "alice@example.com",
+                "public_date": "2026-01-02T03:04:05+00:00",
+            }
+        },
+    }
+
+    anonymized = anonymize_record(record)
+
+    assert anonymized["meta"]["data_info"]["url"] == "https://github.com/owner/project"
+    assert anonymized["meta"]["data_info"]["public_date"] == "2026-01-02T03:04:05+00:00"
+    assert "alice@example.com" not in anonymized["text"]
+    assert "13800138000" not in anonymized["text"]
+    assert anonymized["meta"]["data_info"]["author"] == "xxxxxxxxxxxxxxxxx"
+
+
 def test_build_record_uses_commit_hash_id_and_required_metadata():
     repo = RepoInfo(
         full_name="owner/webapp",
@@ -1090,6 +1146,380 @@ def test_write_stackoverflow_records_outputs_jsonl(tmp_path: Path):
 
     assert written == 1
     assert json.loads(output_path.read_text(encoding="utf-8")) == records[0]
+
+
+def test_parse_stackoverflow_dump_args_sets_streaming_defaults():
+    args = parse_stackoverflow_dump_args(["--posts-xml", "Posts.xml"])
+
+    assert args.posts_xml == "Posts.xml"
+    assert args.output_dir == "final_data_stackoverflow_dump"
+    assert args.tags == ["python", "java", "javascript", "go", "c++"]
+    assert args.since == ""
+    assert args.min_answers == 10
+    assert args.max_records == 0
+    assert args.max_answers == 5
+    assert args.records_per_file == 500
+    assert args.progress_interval == 100_000
+
+
+def test_stackoverflow_dump_question_to_record_matches_api_shape():
+    question = {
+        "Id": "123",
+        "Title": "How do I parse JSON safely?",
+        "Body": "<p>I need Python code.</p><pre><code>json.loads(text)</code></pre>",
+        "Tags": "<python><json>",
+        "Score": "42",
+        "ViewCount": "9000",
+        "AnswerCount": "2",
+        "AcceptedAnswerId": "456",
+        "OwnerDisplayName": "Question Author",
+        "CreationDate": "2024-01-01T00:00:00.000",
+    }
+    answers = [
+        {
+            "Id": "456",
+            "Body": "<p>Use <code>json.loads</code>.</p>",
+            "Score": "81",
+            "CreationDate": "2024-01-01T00:01:00.000",
+            "OwnerDisplayName": "Answer Author",
+        }
+    ]
+
+    record = stackoverflow_dump_question_to_record(question, answers, matching_tag="python")
+
+    assert record["id"] == "stackoverflow_question_123"
+    assert "Title: How do I parse JSON safely?" in record["text"]
+    assert "Answer 1" in record["text"]
+    assert record["meta"]["data_info"] == {
+        "source": "StackOverflow",
+        "type": "技术问答",
+        "url": "https://stackoverflow.com/questions/123",
+        "license": "CC BY-SA 4.0",
+        "site": "stackoverflow",
+        "tag": "python",
+        "tags": ["python", "json"],
+        "score": 42,
+        "views": 9000,
+        "answer_count": 2,
+        "author": "Question Author",
+        "public_date": "2024-01-01T00:00:00+00:00",
+    }
+
+
+def test_write_stackoverflow_dump_jsonl_streams_posts_xml(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="2" AcceptedAnswerId="3" Title="Python JSON error" Tags="&lt;python&gt;&lt;json&gt;" Body="&lt;p&gt;How to parse JSON?&lt;/p&gt;" OwnerDisplayName="Alice" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:01:00.000" Score="5" Body="&lt;p&gt;Low score answer&lt;/p&gt;" OwnerDisplayName="Bob" />
+  <row Id="3" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Use json.loads.&lt;/p&gt;" OwnerDisplayName="Carol" />
+  <row Id="4" PostTypeId="1" CreationDate="2023-01-01T00:00:00.000" Score="100" ViewCount="1000" AnswerCount="1" Title="Old Python question" Tags="&lt;python&gt;" Body="&lt;p&gt;Old&lt;/p&gt;" />
+  <row Id="5" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="1" ViewCount="1000" AnswerCount="1" Title="Low score" Tags="&lt;python&gt;" Body="&lt;p&gt;Low&lt;/p&gt;" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "stackoverflow_dump.jsonl"
+
+    written = write_stackoverflow_dump_jsonl(
+        posts_xml=posts_xml,
+        output_path=output_path,
+        tags=["python"],
+        since="2024-01-01",
+        min_score=10,
+        min_answers=1,
+        max_answers=1,
+        max_records=100,
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert written == 1
+    assert len(rows) == 1
+    assert rows[0]["id"] == "stackoverflow_question_1"
+    assert "Use json.loads." in rows[0]["text"]
+    assert "Low score answer" not in rows[0]["text"]
+
+
+def test_stackoverflow_dump_filters_to_code_analysis_questions(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="3" Title="Python career question" Tags="&lt;python&gt;" Body="&lt;p&gt;What should I learn next?&lt;/p&gt;" />
+  <row Id="2" PostTypeId="1" CreationDate="2024-02-02T00:00:00.000" Score="30" ViewCount="1000" AnswerCount="3" Title="Python list bug" Tags="&lt;python&gt;" Body="&lt;p&gt;Why does this code fail?&lt;/p&gt;&lt;pre&gt;&lt;code&gt;items.append(x)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="3" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:01:00.000" Score="30" Body="&lt;p&gt;Because append mutates the list.&lt;/p&gt;" />
+  <row Id="4" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:02:00.000" Score="20" Body="&lt;p&gt;Return value is None.&lt;/p&gt;" />
+  <row Id="5" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:03:00.000" Score="10" Body="&lt;p&gt;Use a separate assignment.&lt;/p&gt;" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "stackoverflow_dump.jsonl"
+
+    written = write_stackoverflow_dump_jsonl(
+        posts_xml=posts_xml,
+        output_path=output_path,
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=3,
+        max_answers=5,
+        max_records=100,
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert written == 1
+    assert rows[0]["id"] == "stackoverflow_question_2"
+    assert "items.append(x)" in rows[0]["text"]
+    assert "What should I learn next" not in rows[0]["text"]
+
+
+def test_stackoverflow_dump_is_code_analysis_question_detects_code_shapes():
+    assert stackoverflow_dump_is_code_analysis_question(
+        {"Body": "<p>Why?</p><pre><code>print(value)</code></pre>", "Title": "Python error"}
+    )
+    assert not stackoverflow_dump_is_code_analysis_question(
+        {"Body": "<p>Which programming language should I learn?</p>", "Title": "Career advice"}
+    )
+
+
+def test_write_stackoverflow_dump_jsonl_keeps_highest_score_answer_before_accepted(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="2" AcceptedAnswerId="2" Title="Python JSON error" Tags="&lt;python&gt;&lt;json&gt;" Body="&lt;p&gt;How to parse JSON?&lt;/p&gt;" OwnerDisplayName="Alice" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:01:00.000" Score="5" Body="&lt;p&gt;Accepted answer&lt;/p&gt;" OwnerDisplayName="Bob" />
+  <row Id="3" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;High score answer&lt;/p&gt;" OwnerDisplayName="Carol" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "stackoverflow_dump.jsonl"
+
+    write_stackoverflow_dump_jsonl(
+        posts_xml=posts_xml,
+        output_path=output_path,
+        tags=["python"],
+        since="2024-01-01",
+        min_score=10,
+        min_answers=1,
+        max_answers=1,
+        max_records=100,
+    )
+
+    row = json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])
+    assert "High score answer" in row["text"]
+    assert "Accepted answer" not in row["text"]
+
+
+def test_stackoverflow_dump_main_writes_output_file(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="1" Title="Python JSON error" Tags="&lt;python&gt;&lt;json&gt;" Body="&lt;p&gt;How to parse JSON?&lt;/p&gt;" OwnerDisplayName="Alice" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Use json.loads.&lt;/p&gt;" OwnerDisplayName="Carol" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "final_data_stackoverflow_dump"
+
+    assert stackoverflow_dump_main(
+        [
+            "--posts-xml",
+            str(posts_xml),
+            "--output-dir",
+            str(output_dir),
+            "--tags",
+            "python",
+            "--since",
+            "2024-01-01",
+            "--min-score",
+            "10",
+            "--min-answers",
+            "1",
+            "--records-per-file",
+            "500",
+        ]
+    ) == 0
+
+    output_path = output_dir / "stackoverflow_dump_000001.jsonl"
+    assert output_path.exists()
+    assert json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])["id"] == "stackoverflow_question_1"
+    assert read_stackoverflow_dump_checkpoint(output_dir / "stackoverflow_dump.checkpoint.json")["last_question_id"] == 1
+
+
+def test_write_stackoverflow_dump_batches_resumes_from_checkpoint(tmp_path: Path):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="1" Title="Python one" Tags="&lt;python&gt;" Body="&lt;p&gt;Question one&lt;/p&gt;&lt;pre&gt;&lt;code&gt;print(one)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="2" PostTypeId="1" CreationDate="2024-02-02T00:00:00.000" Score="30" ViewCount="1000" AnswerCount="1" Title="Python two" Tags="&lt;python&gt;" Body="&lt;p&gt;Question two&lt;/p&gt;&lt;pre&gt;&lt;code&gt;print(two)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="3" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Answer one&lt;/p&gt;" />
+  <row Id="4" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:02:00.000" Score="60" Body="&lt;p&gt;Answer two&lt;/p&gt;" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    checkpoint = output_dir / "checkpoint.json"
+
+    first_written = write_stackoverflow_dump_batches(
+        posts_xml=posts_xml,
+        output_dir=output_dir,
+        output_prefix="stackoverflow_dump",
+        checkpoint_file=checkpoint,
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=1,
+        max_answers=5,
+        max_records=1,
+        records_per_file=1,
+    )
+    second_written = write_stackoverflow_dump_batches(
+        posts_xml=posts_xml,
+        output_dir=output_dir,
+        output_prefix="stackoverflow_dump",
+        checkpoint_file=checkpoint,
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=1,
+        max_answers=5,
+        max_records=1,
+        records_per_file=1,
+    )
+
+    assert first_written == 1
+    assert second_written == 1
+    assert json.loads(stackoverflow_dump_output_path(output_dir, "stackoverflow_dump", 1).read_text(encoding="utf-8"))["id"] == "stackoverflow_question_1"
+    assert json.loads(stackoverflow_dump_output_path(output_dir, "stackoverflow_dump", 2).read_text(encoding="utf-8"))["id"] == "stackoverflow_question_2"
+    assert read_stackoverflow_dump_checkpoint(checkpoint) == {
+        "last_question_id": 2,
+        "next_file_index": 3,
+        "written_records": 2,
+    }
+
+
+def test_write_stackoverflow_dump_batches_prints_progress(tmp_path: Path, capsys):
+    posts_xml = tmp_path / "Posts.xml"
+    posts_xml.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<posts>
+  <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="10" Title="Python one" Tags="&lt;python&gt;" Body="&lt;p&gt;Question one&lt;/p&gt;&lt;pre&gt;&lt;code&gt;print(one)&lt;/code&gt;&lt;/pre&gt;" />
+  <row Id="2" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:02:00.000" Score="50" Body="&lt;p&gt;Answer one&lt;/p&gt;" />
+</posts>
+""",
+        encoding="utf-8",
+    )
+
+    write_stackoverflow_dump_batches(
+        posts_xml=posts_xml,
+        output_dir=tmp_path / "out",
+        output_prefix="stackoverflow_dump",
+        checkpoint_file=tmp_path / "out" / "checkpoint.json",
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=10,
+        max_answers=5,
+        max_records=None,
+        records_per_file=500,
+        progress_interval=1,
+    )
+
+    output = capsys.readouterr().out
+    assert "Posts.xml question scan:" in output
+    assert "Posts.xml answer scan:" in output
+    assert "Posts.xml question scan done:" in output
+    assert "Posts.xml answer scan done:" in output
+
+
+def test_extract_public_article_urls_filters_csdn_and_zhihu_shapes():
+    html = """
+    <a href="https://blog.csdn.net/alice/article/details/123">CSDN</a>
+    <a href="https://blog.csdn.net/alice/article/details/123?spm=1001">duplicate</a>
+    <a href="https://zhuanlan.zhihu.com/p/456">Zhihu column</a>
+    <a href="https://www.zhihu.com/question/123/answer/456">Zhihu answer</a>
+    <a href="https://example.com/post">Other</a>
+    """
+
+    assert extract_public_article_urls(html, source="csdn") == [
+        "https://blog.csdn.net/alice/article/details/123"
+    ]
+    assert extract_public_article_urls(html, source="zhihu") == [
+        "https://zhuanlan.zhihu.com/p/456",
+        "https://www.zhihu.com/question/123/answer/456",
+    ]
+
+
+def test_public_article_to_record_cleans_code_related_article():
+    body = " ".join(["Python 代码调试"] * 80)
+    html = f"""
+    <html>
+      <head>
+        <title>Python requests 报错处理 - CSDN</title>
+        <meta name="author" content="Alice">
+        <meta property="article:published_time" content="2026-01-02T03:04:05+08:00">
+      </head>
+      <body>
+        <script>window.secret = true;</script>
+        <article>
+          <h1>Python requests 报错处理</h1>
+          <pre>def fetch(url): return requests.get(url)</pre>
+          <p>{body}</p>
+        </article>
+      </body>
+    </html>
+    """
+
+    record = public_article_to_record(
+        source="csdn",
+        url="https://blog.csdn.net/alice/article/details/123",
+        html=html,
+        min_chars=100,
+    )
+
+    assert record is not None
+    assert record["id"] == "csdn_blog.csdn.net__alice__article__details__123"
+    assert record["meta"]["data_info"]["source"] == "CSDN"
+    assert record["meta"]["data_info"]["author"] == "Alice"
+    assert record["meta"]["data_info"]["public_date"] == "2026-01-02T03:04:05+08:00"
+    assert "window.secret" not in record["text"]
+    assert "def fetch" in record["text"]
+
+
+def test_collect_public_article_records_skips_wrong_source_and_short_pages(monkeypatch):
+    good_html = "<title>Go error</title><article>" + ("Go 代码 error return func() " * 40) + "</article>"
+    short_html = "<title>Too short</title><article>hello</article>"
+
+    def fake_get_text(url: str) -> str:
+        if "good" in url:
+            return good_html
+        return short_html
+
+    monkeypatch.setattr(harvester, "public_article_get_text", fake_get_text)
+
+    records = collect_public_article_records(
+        source="zhihu",
+        urls=[
+            "https://zhuanlan.zhihu.com/p/good",
+            "https://zhuanlan.zhihu.com/p/short",
+            "https://blog.csdn.net/alice/article/details/123",
+        ],
+        max_records=10,
+        min_chars=80,
+        sleep_seconds=0,
+    )
+
+    assert [record["meta"]["data_info"]["url"] for record in records] == [
+        "https://zhuanlan.zhihu.com/p/good"
+    ]
 
 
 def test_resolve_token_prefers_cli_value_then_falls_back_to_env(tmp_path: Path, monkeypatch):

@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from pathlib import Path
@@ -27,6 +28,8 @@ SOURCE_NAME = "GitHub"
 GITLAB_SOURCE_NAME = "GitLab"
 GITEE_SOURCE_NAME = "Gitee"
 STACKOVERFLOW_SOURCE_NAME = "StackOverflow"
+CSDN_SOURCE_NAME = "CSDN"
+ZHIHU_SOURCE_NAME = "Zhihu"
 GITLAB_BASE_URL = "https://gitlab.com"
 GITEE_API_BASE_URL = "https://gitee.com/api/v5"
 GITHUB_SEARCH_MAX_PAGES = 10
@@ -38,6 +41,67 @@ GITEE_DEFAULT_SEED_ORGS = ("dromara", "openeuler", "mindspore", "openharmony", "
 TOKEN_CONFIG_PATH = "token.json"
 STACKEXCHANGE_API_BASE_URL = "https://api.stackexchange.com/2.3"
 DISCUSSION_TAGS = ("python", "java", "javascript", "go", "c++")
+ARTICLE_QUERIES = ("python", "java", "javascript", "go", "c++", "代码")
+ARTICLE_SEARCH_URLS = {
+    "csdn": "https://so.csdn.net/so/search?q={query}&t=blog&p={page}",
+    "zhihu": "https://www.zhihu.com/search?type=content&q={query}&page={page}",
+}
+CODE_DISCUSSION_TERMS = {
+    "api",
+    "bug",
+    "class",
+    "code",
+    "commit",
+    "css",
+    "debug",
+    "def ",
+    "docker",
+    "error",
+    "exception",
+    "function",
+    "github",
+    "html",
+    "http",
+    "java",
+    "javascript",
+    "json",
+    "linux",
+    "npm",
+    "python",
+    "react",
+    "return ",
+    "spring",
+    "sql",
+    "vue",
+    "代码",
+    "函数",
+    "报错",
+    "数据库",
+    "编程",
+    "算法",
+}
+ANONYMIZE_SKIP_KEYS = {
+    "clone_url",
+    "html_url",
+    "license",
+    "public_date",
+    "site",
+    "source",
+    "source_url",
+    "url",
+}
+DIRECT_PII_PATTERNS = (
+    re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])"),
+    re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"),
+    re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"),
+    re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)"),
+    re.compile(r"(?<!\d)(?:\+?86[\s-]?)?1[3-9]\d{9}(?!\d)"),
+)
+LABELED_PII_PATTERN = re.compile(
+    r"(?i)(出生日期|生日|birth(?:day| date)?|dob|地址|address|passport(?: no\.?)?|护照号|"
+    r"driver'?s license|驾照号|银行卡|信用卡|微信号?|wechat|weixin|微博|weibo|抖音|douyin)"
+    r"([：:=\s]+)([^\s,;，。]+)"
+)
 
 CODE_EXTENSIONS = {
     ".c",
@@ -245,6 +309,42 @@ def parse_stackoverflow_args(argv: Sequence[str] | None = None) -> argparse.Name
     parser.add_argument("--page-size", type=int, default=100, help="Stack Exchange API page size, capped at 100.")
     parser.add_argument("--stackexchange-key", default=None, help="Optional Stack Exchange API key. Overrides token.json and STACKEXCHANGE_KEY.")
     parser.add_argument("--sleep-seconds", type=float, default=0.25, help="Sleep between API pages.")
+    return parser.parse_args(argv)
+
+
+def parse_stackoverflow_dump_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Stream Stack Overflow Posts.xml dump into technical Q&A JSONL."
+    )
+    parser.add_argument("--posts-xml", required=True, help="Path to Stack Overflow Posts.xml.")
+    parser.add_argument("--output-dir", default="final_data_stackoverflow_dump", help="Directory for dump JSONL output.")
+    parser.add_argument("--output-prefix", default="stackoverflow_dump", help="Output JSONL file prefix.")
+    parser.add_argument("--checkpoint-file", default=None, help="Checkpoint JSON path. Defaults to <output-dir>/<output-prefix>.checkpoint.json.")
+    parser.add_argument("--reset-checkpoint", action="store_true", help="Ignore any existing checkpoint and start from the beginning.")
+    parser.add_argument("--tags", nargs="+", default=list(DISCUSSION_TAGS), help="Question tags to keep.")
+    parser.add_argument("--since", default="", help="Optional lower bound for question creation date, YYYY-MM-DD.")
+    parser.add_argument("--min-score", type=int, default=10, help="Minimum question score.")
+    parser.add_argument("--min-answers", type=int, default=10, help="Minimum answer count.")
+    parser.add_argument("--max-records", type=int, default=0, help="Maximum question records to write. 0 means no limit.")
+    parser.add_argument("--max-answers", type=int, default=5, help="Maximum highest-score answers included per question.")
+    parser.add_argument("--records-per-file", type=int, default=500, help="Number of records per output JSONL file.")
+    parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed Posts.xml rows.")
+    return parser.parse_args(argv)
+
+
+def parse_public_article_args(source: str, argv: Sequence[str] | None = None) -> argparse.Namespace:
+    source_label = CSDN_SOURCE_NAME if source == "csdn" else ZHIHU_SOURCE_NAME
+    parser = argparse.ArgumentParser(
+        description=f"Fetch public {source_label} code-related articles or answers as JSONL."
+    )
+    parser.add_argument("--output-dir", default=f"final_data_{source}", help=f"Directory for {source_label} JSONL files.")
+    parser.add_argument("--queries", nargs="*", default=list(ARTICLE_QUERIES), help="Search keywords to collect.")
+    parser.add_argument("--url", action="append", default=[], help="Explicit public article/answer URL. Can be repeated.")
+    parser.add_argument("--url-file", default=None, help="Text file with one public URL per line.")
+    parser.add_argument("--max-pages", type=int, default=3, help="Search result pages to scan per query.")
+    parser.add_argument("--max-records", type=int, default=1000, help="Maximum records to write.")
+    parser.add_argument("--min-chars", type=int, default=300, help="Minimum cleaned text characters per record.")
+    parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Sleep between HTTP requests.")
     return parser.parse_args(argv)
 
 
@@ -524,13 +624,44 @@ def has_any_term(combined: str, words: set[str], terms: Sequence[str]) -> bool:
     return False
 
 
+def mask_with_x(match: re.Match[str]) -> str:
+    return "x" * len(match.group(0))
+
+
+def anonymize_labeled_pii(match: re.Match[str]) -> str:
+    label, separator, value = match.groups()
+    return f"{label}{separator}{'x' * len(value)}"
+
+
+def anonymize_text(value: str) -> str:
+    anonymized = value
+    for pattern in DIRECT_PII_PATTERNS:
+        anonymized = pattern.sub(mask_with_x, anonymized)
+    return LABELED_PII_PATTERN.sub(anonymize_labeled_pii, anonymized)
+
+
+def anonymize_record(value, key: str | None = None):
+    if isinstance(value, str):
+        if key in ANONYMIZE_SKIP_KEYS:
+            return value
+        return anonymize_text(value)
+    if isinstance(value, list):
+        return [anonymize_record(item, key=key) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_key: anonymize_record(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    return value
+
+
 def build_record(
     repo: RepoInfo,
     commit: CommitInfo,
     text: str,
     project_type: str,
 ) -> dict:
-    return {
+    return anonymize_record({
         "id": commit.sha,
         "text": text,
         "meta": {
@@ -544,7 +675,7 @@ def build_record(
                 "project_type": project_type,
             }
         },
-    }
+    })
 
 
 class StackOverflowHTMLTextParser(HTMLParser):
@@ -593,6 +724,203 @@ def html_to_text(value: str | None) -> str:
     return parser.text()
 
 
+class PublicArticleHTMLParser(HTMLParser):
+    TEXT_TAGS = {
+        "article",
+        "blockquote",
+        "code",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "main",
+        "p",
+        "pre",
+        "section",
+        "span",
+        "td",
+        "th",
+    }
+    SKIP_TAGS = {"script", "style", "noscript", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.meta: dict[str, str] = {}
+        self._in_title = False
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag == "title":
+            self._in_title = True
+        if tag == "a" and attrs_dict.get("href"):
+            self.links.append(attrs_dict["href"])
+        if tag == "meta":
+            key = (
+                attrs_dict.get("property")
+                or attrs_dict.get("name")
+                or attrs_dict.get("itemprop")
+                or ""
+            ).lower()
+            content = attrs_dict.get("content") or ""
+            if key and content:
+                self.meta.setdefault(key, content)
+        if tag in self.TEXT_TAGS:
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if tag == "title":
+            self._in_title = False
+        if tag in self.TEXT_TAGS:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._in_title:
+            self.title_parts.append(data)
+        self.text_parts.append(data)
+
+    def title(self) -> str:
+        return normalize_discussion_text("".join(self.title_parts))
+
+    def text(self) -> str:
+        return normalize_discussion_text("".join(self.text_parts))
+
+
+def normalize_discussion_text(value: str) -> str:
+    raw = html_lib.unescape(value or "")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t\u00a0]+", " ", line).strip() for line in raw.splitlines()]
+    compact: list[str] = []
+    previous_blank = False
+    for line in lines:
+        if not line:
+            if not previous_blank:
+                compact.append("")
+            previous_blank = True
+            continue
+        compact.append(line)
+        previous_blank = False
+    return "\n".join(compact).strip()
+
+
+def parse_public_article_html(html: str) -> tuple[str, str, dict[str, str], list[str]]:
+    parser = PublicArticleHTMLParser()
+    parser.feed(html)
+    parser.close()
+    return parser.title(), parser.text(), parser.meta, parser.links
+
+
+def canonical_public_article_url(url: str, base_url: str = "") -> str:
+    absolute = urllib.parse.urljoin(base_url, html_lib.unescape(url.strip()))
+    parsed = urllib.parse.urlparse(absolute)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    clean = parsed._replace(fragment="", query="")
+    return urllib.parse.urlunparse(clean)
+
+
+def article_url_source(url: str) -> str | None:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path
+    if "blog.csdn.net" in host and "/article/details/" in path:
+        return "csdn"
+    if host == "zhuanlan.zhihu.com" and path.startswith("/p/"):
+        return "zhihu"
+    if host.endswith("zhihu.com") and re.search(r"/question/\d+(/answer/\d+)?", path):
+        return "zhihu"
+    return None
+
+
+def extract_public_article_urls(html: str, source: str, base_url: str = "") -> list[str]:
+    _, _, _, links = parse_public_article_html(html)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        url = canonical_public_article_url(link, base_url=base_url)
+        if not url or article_url_source(url) != source or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def public_article_id(source: str, url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    slug = safe_repo_name(f"{parsed.netloc}{parsed.path}").strip("_")
+    return f"{source}_{slug}"
+
+
+def public_article_author(meta: dict[str, str]) -> str:
+    for key in ("author", "article:author", "og:article:author", "profile:username"):
+        if meta.get(key):
+            return meta[key].strip()
+    return "unknown"
+
+
+def public_article_date(meta: dict[str, str]) -> str:
+    for key in (
+        "article:published_time",
+        "datepublished",
+        "publishdate",
+        "pubdate",
+        "weibo:article:create_at",
+        "og:release_date",
+    ):
+        if meta.get(key):
+            return meta[key].strip()
+    return ""
+
+
+def is_code_related_text(text: str) -> bool:
+    lowered = text.lower()
+    if any(term in lowered for term in CODE_DISCUSSION_TERMS):
+        return True
+    return bool(re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*[{;]?", text))
+
+
+def public_article_to_record(
+    source: str,
+    url: str,
+    html: str,
+    min_chars: int = 300,
+) -> dict | None:
+    title, body, meta, _ = parse_public_article_html(html)
+    title = meta.get("og:title") or meta.get("twitter:title") or title
+    text = normalize_discussion_text(f"Title: {title}\n\n{body}")
+    if len(text) < min_chars or not is_code_related_text(text):
+        return None
+    source_name = CSDN_SOURCE_NAME if source == "csdn" else ZHIHU_SOURCE_NAME
+    return anonymize_record({
+        "id": public_article_id(source, url),
+        "text": text + "\n",
+        "meta": {
+            "data_info": {
+                "source": source_name,
+                "type": "技术文章",
+                "url": url,
+                "author": public_article_author(meta),
+                "public_date": public_article_date(meta),
+            }
+        },
+    })
+
+
 def unix_timestamp_to_iso(timestamp: int | float | None) -> str:
     if timestamp is None:
         return ""
@@ -626,7 +954,7 @@ def stackoverflow_question_to_record(
             ]
         )
     owner = question.get("owner") or {}
-    return {
+    return anonymize_record({
         "id": f"stackoverflow_question_{question_id}",
         "text": "\n".join(part for part in text_parts if part is not None).strip() + "\n",
         "meta": {
@@ -645,15 +973,341 @@ def stackoverflow_question_to_record(
                 "public_date": unix_timestamp_to_iso(question.get("creation_date")),
             }
         },
-    }
+    })
 
 
 def write_stackoverflow_records(records: Sequence[dict], output_path: Path) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fp:
         for record in records:
-            fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            fp.write(json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
     return len(records)
+
+
+def parse_stackoverflow_tags(value: str | None) -> list[str]:
+    return re.findall(r"<([^>]+)>", value or "")
+
+
+def parse_stackoverflow_dump_date(value: str | None) -> dt.datetime:
+    if not value:
+        return dt.datetime.min.replace(tzinfo=dt.UTC)
+    normalized = value.replace("Z", "+00:00")
+    parsed = dt.datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed
+
+
+def stackoverflow_dump_is_code_analysis_question(question: dict[str, str]) -> bool:
+    body = question.get("Body") or ""
+    title = question.get("Title") or ""
+    if re.search(r"</?(pre|code)\b", body, re.I):
+        return True
+    text = html_to_text(f"{title}\n{body}")
+    return bool(
+        re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)", text)
+        or re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=", text)
+        or re.search(r"\b(class|def|function|return|import|select|insert|update|delete)\b", text, re.I)
+        or re.search(r"\b(error|exception|traceback|stack trace|null pointer|undefined)\b", text, re.I)
+    )
+
+
+def stackoverflow_dump_question_to_record(
+    question: dict[str, str],
+    answers: Sequence[dict[str, str]],
+    matching_tag: str,
+) -> dict:
+    question_id = question["Id"]
+    selected_answers = sorted(
+        answers,
+        key=lambda answer: int(answer.get("Score") or 0),
+        reverse=True,
+    )
+    text_parts = [
+        f"Title: {html_to_text(question.get('Title'))}",
+        "",
+        f"Question:\n{html_to_text(question.get('Body'))}",
+    ]
+    for index, answer in enumerate(selected_answers, start=1):
+        label = f"Answer {index}"
+        text_parts.extend(
+            [
+                "",
+                f"{label} (score: {int(answer.get('Score') or 0)}):",
+                html_to_text(answer.get("Body")),
+            ]
+        )
+    creation_date = parse_stackoverflow_dump_date(question.get("CreationDate"))
+    return anonymize_record({
+        "id": f"stackoverflow_question_{question_id}",
+        "text": "\n".join(part for part in text_parts if part is not None).strip() + "\n",
+        "meta": {
+            "data_info": {
+                "source": STACKOVERFLOW_SOURCE_NAME,
+                "type": "技术问答",
+                "url": f"https://stackoverflow.com/questions/{question_id}",
+                "license": "CC BY-SA 4.0",
+                "site": "stackoverflow",
+                "tag": matching_tag,
+                "tags": parse_stackoverflow_tags(question.get("Tags")),
+                "score": int(question.get("Score") or 0),
+                "views": int(question.get("ViewCount") or 0),
+                "answer_count": int(question.get("AnswerCount") or 0),
+                "author": question.get("OwnerDisplayName") or question.get("OwnerUserId") or "unknown",
+                "public_date": creation_date.isoformat(timespec="seconds"),
+            }
+        },
+    })
+
+
+def iter_stackoverflow_post_rows(posts_xml: Path) -> Iterable[dict[str, str]]:
+    for event, elem in ET.iterparse(posts_xml, events=("end",)):
+        if elem.tag == "row":
+            yield dict(elem.attrib)
+        elem.clear()
+
+
+def select_stackoverflow_dump_questions(
+    posts_xml: Path,
+    tags: Sequence[str],
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_records: int | None,
+    start_after_id: int = 0,
+    progress_interval: int = 100_000,
+) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    tag_set = {tag.lower() for tag in tags}
+    since_date = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.UTC) if since else None
+    questions: dict[str, dict[str, str]] = {}
+    matching_tags: dict[str, str] = {}
+    scanned_rows = 0
+    scanned_questions = 0
+    for row in iter_stackoverflow_post_rows(posts_xml):
+        scanned_rows += 1
+        if progress_interval > 0 and scanned_rows % progress_interval == 0:
+            print(
+                f"Posts.xml question scan: rows={scanned_rows} questions={scanned_questions} selected={len(questions)} last_id={row.get('Id', '')}",
+                flush=True,
+            )
+        if row.get("PostTypeId") != "1":
+            continue
+        scanned_questions += 1
+        question_id = row.get("Id")
+        if not question_id:
+            continue
+        if int(question_id) <= start_after_id:
+            continue
+        question_tags = parse_stackoverflow_tags(row.get("Tags"))
+        matched = next((tag for tag in question_tags if tag.lower() in tag_set), None)
+        if matched is None:
+            continue
+        if not stackoverflow_dump_is_code_analysis_question(row):
+            continue
+        if since_date is not None and parse_stackoverflow_dump_date(row.get("CreationDate")) < since_date:
+            continue
+        if int(row.get("Score") or 0) < min_score:
+            continue
+        if int(row.get("AnswerCount") or 0) < min_answers:
+            continue
+        questions[question_id] = row
+        matching_tags[question_id] = matched
+        if max_records is not None and len(questions) >= max_records:
+            break
+    print(
+        f"Posts.xml question scan done: rows={scanned_rows} questions={scanned_questions} selected={len(questions)}",
+        flush=True,
+    )
+    return questions, matching_tags
+
+
+def collect_stackoverflow_dump_answers(
+    posts_xml: Path,
+    questions: dict[str, dict[str, str]],
+    max_answers: int,
+    progress_interval: int = 100_000,
+) -> dict[str, list[dict[str, str]]]:
+    question_ids = set(questions)
+    answers: dict[str, list[dict[str, str]]] = {question_id: [] for question_id in question_ids}
+    scanned_rows = 0
+    matched_answers = 0
+    for row in iter_stackoverflow_post_rows(posts_xml):
+        scanned_rows += 1
+        if progress_interval > 0 and scanned_rows % progress_interval == 0:
+            print(
+                f"Posts.xml answer scan: rows={scanned_rows} matched_answers={matched_answers}",
+                flush=True,
+            )
+        if row.get("PostTypeId") != "2":
+            continue
+        parent_id = row.get("ParentId")
+        if parent_id not in question_ids:
+            continue
+        matched_answers += 1
+        bucket = answers.setdefault(parent_id, [])
+        bucket.append(row)
+        bucket.sort(key=lambda answer: int(answer.get("Score") or 0), reverse=True)
+        del bucket[max_answers:]
+    print(
+        f"Posts.xml answer scan done: rows={scanned_rows} matched_answers={matched_answers}",
+        flush=True,
+    )
+    return answers
+
+
+def read_stackoverflow_dump_checkpoint(path: Path) -> dict:
+    if not path.exists():
+        return {"last_question_id": 0, "next_file_index": 1, "written_records": 0}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "last_question_id": int(data.get("last_question_id") or 0),
+        "next_file_index": int(data.get("next_file_index") or 1),
+        "written_records": int(data.get("written_records") or 0),
+    }
+
+
+def write_stackoverflow_dump_checkpoint(
+    path: Path,
+    last_question_id: int,
+    next_file_index: int,
+    written_records: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "last_question_id": last_question_id,
+                "next_file_index": next_file_index,
+                "written_records": written_records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def stackoverflow_dump_output_path(output_dir: Path, output_prefix: str, file_index: int) -> Path:
+    return output_dir / f"{output_prefix}_{file_index:06d}.jsonl"
+
+
+def write_stackoverflow_dump_batches(
+    posts_xml: Path,
+    output_dir: Path,
+    output_prefix: str,
+    checkpoint_file: Path,
+    tags: Sequence[str],
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_answers: int,
+    max_records: int | None,
+    records_per_file: int,
+    progress_interval: int = 100_000,
+    reset_checkpoint: bool = False,
+) -> int:
+    checkpoint = {"last_question_id": 0, "next_file_index": 1, "written_records": 0}
+    if not reset_checkpoint:
+        checkpoint = read_stackoverflow_dump_checkpoint(checkpoint_file)
+    start_after_id = int(checkpoint["last_question_id"])
+    questions, matching_tags = select_stackoverflow_dump_questions(
+        posts_xml=posts_xml,
+        tags=tags,
+        since=since,
+        min_score=min_score,
+        min_answers=min_answers,
+        max_records=max_records,
+        start_after_id=start_after_id,
+        progress_interval=progress_interval,
+    )
+    if not questions:
+        return 0
+    answers = collect_stackoverflow_dump_answers(
+        posts_xml=posts_xml,
+        questions=questions,
+        max_answers=max_answers,
+        progress_interval=progress_interval,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_index = int(checkpoint["next_file_index"])
+    total_written = int(checkpoint["written_records"])
+    batch: list[dict] = []
+    batch_last_question_id = start_after_id
+    current_run_written = 0
+
+    def flush_batch() -> None:
+        nonlocal batch, batch_last_question_id, file_index, total_written, current_run_written
+        if not batch:
+            return
+        output_path = stackoverflow_dump_output_path(output_dir, output_prefix, file_index)
+        with output_path.open("w", encoding="utf-8") as fp:
+            for record in batch:
+                fp.write(json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+        total_written += len(batch)
+        current_run_written += len(batch)
+        write_stackoverflow_dump_checkpoint(
+            checkpoint_file,
+            last_question_id=batch_last_question_id,
+            next_file_index=file_index + 1,
+            written_records=total_written,
+        )
+        print(f"Wrote {len(batch)} records to {output_path}; checkpoint question id {batch_last_question_id}", flush=True)
+        file_index += 1
+        batch = []
+
+    for question_id, question in questions.items():
+        record = stackoverflow_dump_question_to_record(
+            question,
+            answers.get(question_id, []),
+            matching_tag=matching_tags[question_id],
+        )
+        batch.append(record)
+        batch_last_question_id = int(question_id)
+        if len(batch) >= max(1, records_per_file):
+            flush_batch()
+    flush_batch()
+    return current_run_written
+
+
+def write_stackoverflow_dump_jsonl(
+    posts_xml: Path,
+    output_path: Path,
+    tags: Sequence[str],
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_answers: int,
+    max_records: int,
+    progress_interval: int = 0,
+) -> int:
+    questions, matching_tags = select_stackoverflow_dump_questions(
+        posts_xml=posts_xml,
+        tags=tags,
+        since=since,
+        min_score=min_score,
+        min_answers=min_answers,
+        max_records=max_records,
+        progress_interval=progress_interval,
+    )
+    answers = collect_stackoverflow_dump_answers(
+        posts_xml=posts_xml,
+        questions=questions,
+        max_answers=max_answers,
+        progress_interval=progress_interval,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with output_path.open("w", encoding="utf-8") as fp:
+        for question_id, question in questions.items():
+            record = stackoverflow_dump_question_to_record(
+                question,
+                answers.get(question_id, []),
+                matching_tag=matching_tags[question_id],
+            )
+            fp.write(json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+            written += 1
+    return written
 
 
 def write_jsonl_for_commit(
@@ -685,7 +1339,7 @@ def write_jsonl_for_commit(
         project_type=infer_project_type(repo, code_paths),
     )
     with output_path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        fp.write(json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
     return 1
 
 
@@ -718,7 +1372,7 @@ def write_json_for_commit(
         project_type=infer_project_type(repo, code_paths),
     )
     output_path.write_text(
-        json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
     return 1
@@ -1219,6 +1873,25 @@ def stackexchange_get_json(url: str) -> dict:
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def public_article_get_text(url: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "discussion-harvester (+public technical article collection)",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        raw = response.read()
+        content_type = response.headers.get("Content-Type", "")
+    charset_match = re.search(r"charset=([\w.-]+)", content_type, re.I)
+    encoding = charset_match.group(1) if charset_match else "utf-8"
+    try:
+        return raw.decode(encoding, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def stackexchange_api_url(path: str, params: dict[str, object]) -> str:
@@ -1949,6 +2622,151 @@ def stackoverflow_main(argv: Sequence[str] | None = None) -> int:
         total_written += written
         print(f"{tag}: wrote {written} records to {output_path}", flush=True)
     print(f"Wrote {total_written} Stack Overflow records", flush=True)
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def stackoverflow_dump_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_stackoverflow_dump_args(argv)
+    start = time.time()
+    posts_xml = Path(args.posts_xml)
+    output_dir = Path(args.output_dir)
+    checkpoint_file = Path(args.checkpoint_file) if args.checkpoint_file else output_dir / f"{args.output_prefix}.checkpoint.json"
+    max_records = None if args.max_records <= 0 else args.max_records
+    written = write_stackoverflow_dump_batches(
+        posts_xml=posts_xml,
+        output_dir=output_dir,
+        output_prefix=args.output_prefix,
+        checkpoint_file=checkpoint_file,
+        tags=args.tags,
+        since=args.since,
+        min_score=args.min_score,
+        min_answers=args.min_answers,
+        max_answers=args.max_answers,
+        max_records=max_records,
+        records_per_file=args.records_per_file,
+        progress_interval=args.progress_interval,
+        reset_checkpoint=args.reset_checkpoint,
+    )
+    print(f"Wrote {written} Stack Overflow dump records to {output_dir}", flush=True)
+    print(f"Checkpoint: {checkpoint_file}", flush=True)
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def read_url_file(path: Path) -> list[str]:
+    urls: list[str] = []
+    with path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            value = line.strip()
+            if value and not value.startswith("#"):
+                urls.append(value)
+    return urls
+
+
+def discover_public_article_urls(
+    source: str,
+    queries: Sequence[str],
+    max_pages: int,
+    sleep_seconds: float = 1.0,
+) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    template = ARTICLE_SEARCH_URLS[source]
+    for query in queries:
+        for page in range(1, max(1, max_pages) + 1):
+            search_url = template.format(
+                query=urllib.parse.quote(query),
+                page=page,
+            )
+            try:
+                html = public_article_get_text(search_url)
+            except urllib.error.HTTPError as exc:
+                print(f"{source} search {query} page {page}: HTTP {exc.code}; skipping page", flush=True)
+                continue
+            except urllib.error.URLError as exc:
+                print(f"{source} search {query} page {page}: {exc}; skipping page", flush=True)
+                continue
+            page_urls = extract_public_article_urls(html, source=source, base_url=search_url)
+            new_count = 0
+            for url in page_urls:
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append(url)
+                new_count += 1
+            print(f"{source} search {query} page {page}: found {new_count} new urls", flush=True)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+    return urls
+
+
+def collect_public_article_records(
+    source: str,
+    urls: Sequence[str],
+    max_records: int,
+    min_chars: int,
+    sleep_seconds: float = 1.0,
+) -> list[dict]:
+    records: list[dict] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        if len(records) >= max_records:
+            break
+        url = canonical_public_article_url(raw_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        detected_source = article_url_source(url)
+        if detected_source != source:
+            print(f"{url}: skipped unsupported {source} URL shape", flush=True)
+            continue
+        try:
+            html = public_article_get_text(url)
+            record = public_article_to_record(source=source, url=url, html=html, min_chars=min_chars)
+        except urllib.error.HTTPError as exc:
+            print(f"{url}: HTTP {exc.code}; skipped", flush=True)
+            continue
+        except urllib.error.URLError as exc:
+            print(f"{url}: {exc}; skipped", flush=True)
+            continue
+        if record is None:
+            print(f"{url}: skipped empty, short, or non-code article", flush=True)
+            continue
+        records.append(record)
+        print(f"{url}: collected", flush=True)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return records
+
+
+def public_article_main(source: str, argv: Sequence[str] | None = None) -> int:
+    args = parse_public_article_args(source, argv)
+    start = time.time()
+    output_dir = Path(args.output_dir)
+    urls: list[str] = []
+    urls.extend(args.url or [])
+    if args.url_file:
+        urls.extend(read_url_file(Path(args.url_file)))
+    if args.queries and len(urls) < args.max_records:
+        urls.extend(
+            discover_public_article_urls(
+                source=source,
+                queries=args.queries,
+                max_pages=args.max_pages,
+                sleep_seconds=args.sleep_seconds,
+            )
+        )
+    records = collect_public_article_records(
+        source=source,
+        urls=urls,
+        max_records=max(0, args.max_records),
+        min_chars=max(0, args.min_chars),
+        sleep_seconds=args.sleep_seconds,
+    )
+    output_path = output_dir / f"{source}_articles.jsonl"
+    written = write_stackoverflow_records(records, output_path)
+    print(f"Wrote {written} {source} records to {output_path}", flush=True)
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0
 

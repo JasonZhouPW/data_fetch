@@ -2,6 +2,18 @@
 
 自动拉取 GitHub 高星 Go、Java、Python、JavaScript、C++ 项目，读取 `2025-10-01` 之后的代码提交，并按项目生成 JSONL。
 
+## 交付格式与匿名化
+
+所有采集入口输出均为 UTF-8 编码 JSONL，每行一条数据。代码类数据保持如下结构：
+
+```json
+{"id":"hash编码","text":"代码内容","meta":{"data_info":{"lang":"编程语言","source":"数据来源","url":"数据来源的网址","type":"代码","author":"作者","public_date":"数据发布时间","project_type":"项目类别"}}}
+```
+
+问答、文章、漏洞 patch 等非代码数据也会保留 `meta.data_info` 或等价 meta 信息，包含数据来源、来源 URL、作者、发布时间、类型等可追溯字段。
+
+写出 JSONL 前会自动匿名化可唯一识别个人的信息，命中的内容用小写 `x` 替换，包括邮箱、电话号码、社会安全号码、银行卡/信用卡号，以及带明确标签的出生日期、地址、护照号、驾照号、微信/微博/抖音等个人媒体账号。来源 URL、数据来源、发布时间、许可证等溯源字段会保留，以便满足数据追溯要求。
+
 ## 运行
 
 GitHub token 可在项目根目录配置 `token.json`：
@@ -330,7 +342,42 @@ seed JSONL 示例：
 {"id":"CTF-foo-001","source":"CTF","clone_url":"https://github.com/owner/project.git","html_url":"https://github.com/owner/project","fix_commit":"abc123","trigger_code":"./solve.py","assembly":{"comments":"main+0x42 比较输入长度"}}
 ```
 
-运行命令：
+如果还没有 `vuln_seeds.jsonl`，可以先从 NVD 按日期批量下载 CVE 原始记录，并持续扫描到找到目标数量的修复 commit 候选：
+
+```bash
+python3 -m vuln_patch_harvester harvest-nvd-seeds \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31 \
+  --raw-output nvd_raw.jsonl \
+  --seed-output vuln_seeds.jsonl \
+  --target-seeds 10 \
+  --batch-days 30 \
+  --records-per-batch 2000
+```
+
+`harvest-nvd-seeds` 会调用 NVD 2.0 API 下载 CVE 原始记录，在每个日期窗口内提取 GitHub/GitLab/Gitee commit URL，并生成包含 `needs_enrichment=true` 的候选 seed。NVD/OSV 通常没有触发代码和汇编注释，因此正式生成 patch pair 前，需要人工或另一条分析管线补齐：
+
+- `trigger_code`
+- `assembly.disassembly`
+- `assembly.comments`
+
+如果只想精确下载指定数量的 NVD 原始记录，再从本地 JSON/JSONL 里抽取 seed，也可以分两步运行：
+
+```bash
+python3 -m vuln_patch_harvester fetch-nvd \
+  --start-date 2024-01-01 \
+  --end-date 2024-01-31 \
+  --output nvd_raw.jsonl \
+  --max-records 1000
+
+python3 -m vuln_patch_harvester build-seeds \
+  --input nvd_raw.jsonl \
+  --output vuln_seeds.jsonl
+```
+
+如有 NVD API key，可通过 `--api-key` 或环境变量 `NVD_API_KEY` 传入。`build-seeds` 会递归读取 `.json`/`.jsonl`，提取 GitHub/GitLab/Gitee commit URL。
+
+正式运行命令：
 
 ```bash
 python3 -m vuln_patch_harvester \
@@ -347,6 +394,45 @@ python3 -m vuln_patch_harvester \
 final_data_vuln_patch/vuln_patch_pairs.jsonl
 ```
 
+如果需要转换成安全问答训练格式，类似 `以下代码文件存在何种风险隐患？...`，可以继续运行：
+
+```bash
+python3 -m vuln_patch_harvester format-qa \
+  --input final_data_vuln_patch/vuln_patch_pairs.jsonl \
+  --output final_data_vuln_patch/vuln_patch_qa.jsonl
+```
+
+也可以用脚本串起上述流程，默认测试 NVD 2024-01-01 到 2024-01-31，最多输出 10 条 patch/QA。脚本会默认多抓一些 seed 候选，因为不是每个 NVD commit 引用都能抽出代码文件 patch pair：
+
+```bash
+./scripts/run_vuln_patch_sample.sh
+```
+
+覆盖参数示例：
+
+```bash
+./scripts/run_vuln_patch_sample.sh \
+  --start-date 2023-01-01 \
+  --end-date 2023-12-31 \
+  --max-records 10 \
+  --target-seeds 100
+```
+
+如果 seed 已人工补齐 `trigger_code` 和 `assembly.comments`，可开启强制触发代码过滤：
+
+```bash
+REQUIRE_TRIGGER=1 ./scripts/run_vuln_patch_sample.sh
+```
+
+问答格式每条记录包含：
+
+- `id`
+- `text`：漏洞原文代码，按 XML/CDATA 包装。
+- `response`：漏洞说明、触发代码、修复后安全代码、patch diff、修复思路、安全规范解释和汇编注释。
+- `label`
+- `source`
+- `meta`
+
 每条记录包含：
 
 - `code.vulnerable`：修复 commit 的父提交中的漏洞代码。
@@ -359,7 +445,13 @@ final_data_vuln_patch/vuln_patch_pairs.jsonl
 
 ## 技术讨论数据采集
 
-新增 `discussion_harvester` 入口，用于采集代码相关的技术问答和深度讨论数据。当前先支持 Stack Overflow，因为 Stack Exchange 提供官方 API，并且内容许可证清晰；Reddit 和 CSDN 暂不默认采集正文，原因是 API/版权限制更强，建议拿到授权后再接入。
+新增 `discussion_harvester` 入口，用于采集代码相关的技术问答、技术文章和深度讨论数据。当前支持：
+
+- `stackoverflow`：通过 Stack Exchange 官方 API 采集，许可证清晰。
+- `csdn`：采集公开 CSDN 博客文章页面。
+- `zhihu`：采集公开知乎回答或知乎专栏页面。
+
+CSDN/知乎入口只处理公开可访问页面，带限速、域名和 URL 形态过滤；遇到登录墙、反爬限制、短正文或非代码内容会跳过。脚本不会绕过登录、验证码、付费墙或站点访问控制。批量使用前请确认你有相应授权，并遵守站点 robots、服务条款和内容版权要求。
 
 Stack Overflow 完整启动命令示例：
 
@@ -427,3 +519,126 @@ final_data_stackoverflow/stackoverflow_python.jsonl
 - 每个问题合并 title、question body，以及 accepted answer 或高赞 answers。
 - 不同 tag 命中的同一个 question 只写入一次，保留第一次命中的 tag。
 - Stack Overflow 内容许可证为 CC BY-SA，输出中保留 `url`、`author`、`license` 和 `public_date`，后续使用时仍需遵守 attribution 和 share-alike 要求。
+
+### Stack Overflow Dump
+
+如果服务器上已有 Stack Exchange dump，生成问答 JSONL 需要 `Posts.xml`。`Badges.xml`、`Comments.xml`、`PostHistory.xml` 不能单独生成完整问答数据。
+
+本地 dump 入口会流式解析 `Posts.xml`，不会一次性把 6GB+ XML 读入内存。处理命令：
+
+```bash
+python3 -m discussion_harvester stackoverflow-dump \
+  --posts-xml /path/to/Posts.xml \
+  --output-dir final_data_stackoverflow_dump \
+  --tags python java javascript go c++ \
+  --min-score 10 \
+  --min-answers 10 \
+  --max-answers 5 \
+  --records-per-file 500 \
+  --progress-interval 100000
+```
+
+该入口默认产出“代码分析与解释”类数据：只保留编程语言 tag 命中的 question，并要求 question 正文包含代码块、函数调用、赋值、异常/报错、SQL/函数定义等明显代码分析形态；泛泛的职业建议、语言选择、非代码讨论会被跳过。默认要求 question 的 score 不低于 10、answer 数不少于 10，并合并分数最高的 5 条回答，适合做代码解释/问题分析数据。默认不限制总记录数，会一直顺序处理到 `Posts.xml` 结束；如需测试小样本，可显式传 `--max-records 1000`。
+
+输出文件按 500 条一份递增生成：
+
+```text
+final_data_stackoverflow_dump/stackoverflow_dump_000001.jsonl
+final_data_stackoverflow_dump/stackoverflow_dump_000002.jsonl
+...
+```
+
+同时会写 checkpoint：
+
+```text
+final_data_stackoverflow_dump/stackoverflow_dump.checkpoint.json
+```
+
+如果中间错误退出，下一次运行同一命令会读取 checkpoint，从上一次完整写完的 question id 后继续处理。需要从头重跑时加 `--reset-checkpoint`。
+
+dump 参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--posts-xml` | 必填 | Stack Overflow dump 中的 `Posts.xml` 路径。 |
+| `--output-dir` | `final_data_stackoverflow_dump` | dump JSONL 输出目录。 |
+| `--output-prefix` | `stackoverflow_dump` | 输出 JSONL 文件名前缀。 |
+| `--checkpoint-file` | `<output-dir>/<output-prefix>.checkpoint.json` | 续跑 checkpoint 文件。 |
+| `--reset-checkpoint` | 关闭 | 忽略已有 checkpoint，从头开始。 |
+| `--tags` | `python java javascript go c++` | 要保留的问题 tags。 |
+| `--since` | 空 | 可选日期过滤；默认不按时间过滤，顺序读取 dump。 |
+| `--min-score` | `10` | 问题最低 score。 |
+| `--min-answers` | `10` | 问题最低 answer 数。 |
+| `--max-records` | `0` | 最多写入的问题记录数；`0` 表示不限制，处理到 dump 结束。 |
+| `--max-answers` | `5` | 每个问题最多合并的最高赞 answers 数。 |
+| `--records-per-file` | `500` | 每个 JSONL 文件的记录数。 |
+| `--progress-interval` | `100000` | 每扫描多少行 `Posts.xml` 打印一次进度。 |
+
+实现上会扫描 `Posts.xml` 两遍：第一遍从 checkpoint 记录的 question id 后继续顺序筛出符合条件的代码分析/解释类 question，第二遍只收集这些 question 的最高赞 answers，然后按批次写出 JSONL。每扫描 `--progress-interval` 行会打印当前扫描进度，每写完一个 JSONL 文件就更新 checkpoint。
+
+CSDN 公开文章采集示例：
+
+```bash
+python3 -m discussion_harvester csdn \
+  --output-dir final_data_csdn \
+  --queries python java javascript go c++ 代码 \
+  --max-pages 3 \
+  --max-records 1000 \
+  --min-chars 300 \
+  --sleep-seconds 1.0
+```
+
+知乎公开回答/专栏采集示例：
+
+```bash
+python3 -m discussion_harvester zhihu \
+  --output-dir final_data_zhihu \
+  --queries python java javascript go c++ 代码 \
+  --max-pages 3 \
+  --max-records 1000 \
+  --min-chars 300 \
+  --sleep-seconds 1.0
+```
+
+如果已经有授权 URL 清单，建议优先使用显式 URL，稳定性会高于站内搜索页：
+
+```bash
+python3 -m discussion_harvester csdn \
+  --url-file csdn_urls.txt \
+  --queries \
+  --output-dir final_data_csdn
+```
+
+CSDN/知乎参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--output-dir` | `final_data_csdn` / `final_data_zhihu` | JSONL 输出目录。 |
+| `--queries` | `python java javascript go c++ 代码` | 搜索关键词，空格分隔；如果只想处理 `--url`/`--url-file`，可传空的 `--queries`。 |
+| `--url` | 空 | 显式公开文章/回答 URL，可重复传入。 |
+| `--url-file` | 空 | 每行一个公开 URL 的文本文件。 |
+| `--max-pages` | `3` | 每个关键词扫描的搜索结果页数。 |
+| `--max-records` | `1000` | 本次最多写入记录数。 |
+| `--min-chars` | `300` | 清洗后正文最少字符数，低于该值会跳过。 |
+| `--sleep-seconds` | `1.0` | HTTP 请求之间的等待时间。 |
+
+输出文件：
+
+```text
+final_data_csdn/csdn_articles.jsonl
+final_data_zhihu/zhihu_articles.jsonl
+```
+
+每行格式：
+
+```json
+{"id":"csdn_blog.csdn.net__user__article__details__123","text":"Title + cleaned public article body","meta":{"data_info":{"source":"CSDN","type":"技术文章","url":"https://blog.csdn.net/user/article/details/123","author":"作者","public_date":"2026-01-01T00:00:00+08:00"}}}
+```
+
+采集策略：
+
+- CSDN 仅保留 `blog.csdn.net/.../article/details/...`。
+- 知乎仅保留 `zhuanlan.zhihu.com/p/...`、`zhihu.com/question/...` 和 `zhihu.com/question/.../answer/...`。
+- 清洗 HTML 时跳过 `script`、`style`、`noscript`、`svg`，并抽取 title、meta author、meta published time。
+- 通过代码关键词和函数调用形态做轻量过滤，降低泛娱乐、营销或非代码内容混入。
+- 输出中保留来源、URL、作者和发布时间，方便后续去重、授权核查和溯源。
