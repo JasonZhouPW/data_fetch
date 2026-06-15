@@ -50,12 +50,15 @@ from github_code_harvester.harvester import (
     write_jsonl_for_commit,
     parse_stackoverflow_args,
     parse_stackoverflow_dump_args,
+    parse_stackoverflow_dump_from_shards_args,
     parse_stackoverflow_dump_shard_args,
     public_article_to_record,
     read_stackoverflow_dump_checkpoint,
     repo_has_commit_since_via_api,
+    process_stackoverflow_dump_shards,
     shard_stackoverflow_dump_by_question_range,
     stackoverflow_dump_shard_bounds,
+    stackoverflow_dump_from_shards_main,
     stackoverflow_dump_shard_main,
     stackoverflow_dump_shard_path,
     stackoverflow_dump_is_code_analysis_question,
@@ -1177,6 +1180,21 @@ def test_parse_stackoverflow_dump_shard_args_defaults_to_100_shards():
     assert args.progress_interval == 100_000
 
 
+def test_parse_stackoverflow_dump_from_shards_args_defaults_to_parallel_workers():
+    args = parse_stackoverflow_dump_from_shards_args(["--shard-dir", "stackoverflow_dump_shards"])
+
+    assert args.shard_dir == "stackoverflow_dump_shards"
+    assert args.output_dir == "final_data_stackoverflow_dump"
+    assert args.tags == ["python", "java", "javascript", "go", "c++"]
+    assert args.since == ""
+    assert args.min_score == 10
+    assert args.min_answers == 10
+    assert args.max_answers == 5
+    assert args.records_per_file == 500
+    assert args.workers == 10
+    assert args.reset_progress is False
+
+
 def test_stackoverflow_dump_shard_bounds_cover_question_id_ranges():
     assert stackoverflow_dump_shard_bounds(max_question_id=10, shard_count=3) == [
         (1, 4),
@@ -1533,6 +1551,188 @@ def test_stackoverflow_dump_shard_main_writes_manifest(tmp_path: Path):
     assert (shard_dir / "manifest.json").exists()
     assert stackoverflow_dump_shard_path(shard_dir, 0).exists()
     assert stackoverflow_dump_shard_path(shard_dir, 1).exists()
+
+
+def test_process_stackoverflow_dump_shards_writes_jsonl_per_shard(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    stackoverflow_dump_shard_path(shard_dir, 0).write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "Id": "1",
+                        "PostTypeId": "1",
+                        "CreationDate": "2024-02-01T00:00:00.000",
+                        "Score": "25",
+                        "ViewCount": "1000",
+                        "AnswerCount": "10",
+                        "Title": "Python one",
+                        "Tags": "<python>",
+                        "Body": "<p>Question one</p><pre><code>print(one)</code></pre>",
+                    }
+                ),
+                json.dumps({"Id": "10", "PostTypeId": "2", "ParentId": "1", "Score": "1", "Body": "<p>Low</p>"}),
+                json.dumps({"Id": "11", "PostTypeId": "2", "ParentId": "1", "Score": "50", "Body": "<p>High</p>"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stackoverflow_dump_shard_path(shard_dir, 1).write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "Id": "6",
+                        "PostTypeId": "1",
+                        "CreationDate": "2024-02-02T00:00:00.000",
+                        "Score": "5",
+                        "ViewCount": "1000",
+                        "AnswerCount": "10",
+                        "Title": "Low score",
+                        "Tags": "<python>",
+                        "Body": "<pre><code>print(low)</code></pre>",
+                    }
+                ),
+                json.dumps({"Id": "12", "PostTypeId": "2", "ParentId": "6", "Score": "60", "Body": "<p>Skipped</p>"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+
+    summary = process_stackoverflow_dump_shards(
+        shard_dir=shard_dir,
+        output_dir=output_dir,
+        output_prefix="stackoverflow_dump",
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=10,
+        max_answers=5,
+        records_per_file=500,
+        workers=2,
+        progress_interval=1,
+    )
+
+    output_files = sorted(output_dir.glob("*.jsonl"))
+    rows = [json.loads(line) for path in output_files for line in path.read_text(encoding="utf-8").splitlines()]
+    assert summary["records_written"] == 1
+    assert summary["shards_processed"] == 2
+    assert [path.name for path in output_files] == ["stackoverflow_dump_shard_000_000001.jsonl"]
+    assert rows[0]["id"] == "stackoverflow_question_1"
+    assert "High" in rows[0]["text"]
+    assert "Low" in rows[0]["text"]
+    assert "Skipped" not in rows[0]["text"]
+
+
+def test_process_stackoverflow_dump_shards_skips_completed_progress(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    stackoverflow_dump_shard_path(shard_dir, 0).write_text(
+        json.dumps(
+            {
+                "Id": "1",
+                "PostTypeId": "1",
+                "CreationDate": "2024-02-01T00:00:00.000",
+                "Score": "25",
+                "ViewCount": "1000",
+                "AnswerCount": "10",
+                "Title": "Python done",
+                "Tags": "<python>",
+                "Body": "<pre><code>print(done)</code></pre>",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stackoverflow_dump_shard_path(shard_dir, 1).write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "Id": "6",
+                        "PostTypeId": "1",
+                        "CreationDate": "2024-02-02T00:00:00.000",
+                        "Score": "30",
+                        "ViewCount": "1000",
+                        "AnswerCount": "10",
+                        "Title": "Python todo",
+                        "Tags": "<python>",
+                        "Body": "<pre><code>print(todo)</code></pre>",
+                    }
+                ),
+                json.dumps({"Id": "12", "PostTypeId": "2", "ParentId": "6", "Score": "60", "Body": "<p>Todo answer</p>"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "stackoverflow_dump_from_shards.progress.json").write_text(
+        json.dumps(
+            {
+                "completed_shards": {
+                    "shard_000.jsonl": {
+                        "records_written": 1,
+                        "output_files": ["stackoverflow_dump_shard_000_000001.jsonl"],
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "stackoverflow_dump_shard_000_000001.jsonl").write_text(
+        json.dumps({"id": "existing"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = process_stackoverflow_dump_shards(
+        shard_dir=shard_dir,
+        output_dir=output_dir,
+        output_prefix="stackoverflow_dump",
+        tags=["python"],
+        since="",
+        min_score=10,
+        min_answers=10,
+        max_answers=5,
+        records_per_file=500,
+        workers=1,
+        progress_interval=0,
+    )
+
+    assert summary["shards_processed"] == 1
+    assert summary["shards_skipped"] == 1
+    assert summary["records_written"] == 2
+    assert json.loads((output_dir / "stackoverflow_dump_shard_000_000001.jsonl").read_text(encoding="utf-8"))["id"] == "existing"
+    progress = json.loads((output_dir / "stackoverflow_dump_from_shards.progress.json").read_text(encoding="utf-8"))
+    assert sorted(progress["completed_shards"]) == ["shard_000.jsonl", "shard_001.jsonl"]
+
+
+def test_stackoverflow_dump_from_shards_main_writes_summary(tmp_path: Path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    stackoverflow_dump_shard_path(shard_dir, 0).write_text("", encoding="utf-8")
+    output_dir = tmp_path / "out"
+
+    assert stackoverflow_dump_from_shards_main(
+        [
+            "--shard-dir",
+            str(shard_dir),
+            "--output-dir",
+            str(output_dir),
+            "--workers",
+            "1",
+            "--progress-interval",
+            "0",
+        ]
+    ) == 0
+
+    assert (output_dir / "stackoverflow_dump_from_shards.summary.json").exists()
 
 
 def test_extract_public_article_urls_filters_csdn_and_zhihu_shapes():

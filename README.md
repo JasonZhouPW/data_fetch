@@ -613,6 +613,39 @@ PYTHONPATH=. python3 -m discussion_harvester stackoverflow-dump-shard \
   --progress-interval 100000
 ```
 
+`manifest.json` 出现后表示 100 个 shard 都已经生成完成。之后可以用多线程处理这些 shard，生成最终 JSONL：
+
+```bash
+PYTHONPATH=. python3 -m discussion_harvester stackoverflow-dump-from-shards \
+  --shard-dir stackoverflow_dump_shards \
+  --output-dir final_data_stackoverflow_dump \
+  --tags python java javascript go c++ \
+  --min-score 10 \
+  --min-answers 10 \
+  --max-answers 5 \
+  --records-per-file 500 \
+  --workers 10 \
+  --progress-interval 100000
+```
+
+该入口会并行处理 `shard_*.jsonl`，每个 worker 独立写自己 shard 的输出文件，避免多线程同时写同一个 JSONL。输出文件名类似：
+
+```text
+final_data_stackoverflow_dump/stackoverflow_dump_shard_000_000001.jsonl
+final_data_stackoverflow_dump/stackoverflow_dump_shard_001_000001.jsonl
+...
+final_data_stackoverflow_dump/stackoverflow_dump_from_shards.progress.json
+final_data_stackoverflow_dump/stackoverflow_dump_from_shards.summary.json
+```
+
+每个 shard 完成后会立刻更新 `stackoverflow_dump_from_shards.progress.json`。如果中途退出或服务器断开，重新执行同一命令会自动跳过已经完成的 shard，只重新处理未完成的 shard；未完成 shard 重跑前会清理该 shard 自己的旧输出文件，避免半截 JSONL 混入结果。需要强制从头重跑时加：
+
+```bash
+--reset-progress
+```
+
+处理规则与直接处理 `Posts.xml` 的入口保持一致：只保留符合 tag、score、answer 数和代码分析形态的问题，并为每个问题合并分数最高的 5 条回答。`--workers` 控制并发线程数，建议先用 `10`。
+
 CSDN 公开文章采集示例：
 
 ```bash

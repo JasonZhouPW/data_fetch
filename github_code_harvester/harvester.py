@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import datetime as dt
 import html as html_lib
@@ -341,6 +342,25 @@ def parse_stackoverflow_dump_shard_args(argv: Sequence[str] | None = None) -> ar
     parser.add_argument("--shards", type=int, default=100, help="Number of question-id range shards.")
     parser.add_argument("--max-question-id", type=int, default=0, help="Known maximum question id. If omitted, scan Posts.xml once to discover it.")
     parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed Posts.xml rows.")
+    return parser.parse_args(argv)
+
+
+def parse_stackoverflow_dump_from_shards_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Process Stack Overflow dump shard JSONL files into Q&A JSONL with worker threads."
+    )
+    parser.add_argument("--shard-dir", required=True, help="Directory containing shard_*.jsonl files.")
+    parser.add_argument("--output-dir", default="final_data_stackoverflow_dump", help="Directory for output JSONL files.")
+    parser.add_argument("--output-prefix", default="stackoverflow_dump", help="Output JSONL file prefix.")
+    parser.add_argument("--tags", nargs="+", default=list(DISCUSSION_TAGS), help="Question tags to keep.")
+    parser.add_argument("--since", default="", help="Optional lower bound for question creation date, YYYY-MM-DD.")
+    parser.add_argument("--min-score", type=int, default=10, help="Minimum question score.")
+    parser.add_argument("--min-answers", type=int, default=10, help="Minimum answer count.")
+    parser.add_argument("--max-answers", type=int, default=5, help="Maximum highest-score answers included per question.")
+    parser.add_argument("--records-per-file", type=int, default=500, help="Number of records per output JSONL file.")
+    parser.add_argument("--workers", type=int, default=10, help="Number of shard worker threads.")
+    parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed shard rows.")
+    parser.add_argument("--reset-progress", action="store_true", help="Ignore existing shard progress and reprocess all shards.")
     return parser.parse_args(argv)
 
 
@@ -1087,6 +1107,29 @@ def stackoverflow_dump_shard_manifest_path(shard_dir: Path) -> Path:
     return shard_dir / "manifest.json"
 
 
+def stackoverflow_dump_from_shards_summary_path(output_dir: Path) -> Path:
+    return output_dir / "stackoverflow_dump_from_shards.summary.json"
+
+
+def stackoverflow_dump_from_shards_progress_path(output_dir: Path) -> Path:
+    return output_dir / "stackoverflow_dump_from_shards.progress.json"
+
+
+def read_stackoverflow_dump_from_shards_progress(path: Path) -> dict:
+    if not path.exists():
+        return {"completed_shards": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    completed = data.get("completed_shards")
+    return {"completed_shards": completed if isinstance(completed, dict) else {}}
+
+
+def write_stackoverflow_dump_from_shards_progress(path: Path, progress: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def stackoverflow_dump_shard_bounds(max_question_id: int, shard_count: int) -> list[tuple[int, int]]:
     if shard_count < 1:
         raise ValueError("shard_count must be at least 1")
@@ -1314,6 +1357,247 @@ def collect_stackoverflow_dump_answers(
         flush=True,
     )
     return answers
+
+
+def iter_stackoverflow_shard_rows(shard_path: Path) -> Iterable[dict[str, str]]:
+    with shard_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def stackoverflow_dump_shard_output_path(
+    output_dir: Path,
+    output_prefix: str,
+    shard_index: int,
+    file_index: int,
+) -> Path:
+    return output_dir / f"{output_prefix}_shard_{shard_index:03d}_{file_index:06d}.jsonl"
+
+
+def process_stackoverflow_dump_shard(
+    shard_path: Path,
+    shard_index: int,
+    output_dir: Path,
+    output_prefix: str,
+    tags: Sequence[str],
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_answers: int,
+    records_per_file: int,
+    progress_interval: int = 100_000,
+) -> dict:
+    tag_set = {tag.lower() for tag in tags}
+    since_date = dt.datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=dt.UTC) if since else None
+    questions: dict[str, dict[str, str]] = {}
+    matching_tags: dict[str, str] = {}
+    answers: dict[str, list[dict[str, str]]] = {}
+    scanned_rows = 0
+    scanned_questions = 0
+    scanned_answers = 0
+    for row in iter_stackoverflow_shard_rows(shard_path):
+        scanned_rows += 1
+        if progress_interval > 0 and scanned_rows % progress_interval == 0:
+            print(
+                f"{shard_path.name}: scan rows={scanned_rows} questions={scanned_questions} answers={scanned_answers} selected={len(questions)}",
+                flush=True,
+            )
+        if row.get("PostTypeId") == "1":
+            scanned_questions += 1
+            question_id = row.get("Id")
+            if not question_id:
+                continue
+            question_tags = parse_stackoverflow_tags(row.get("Tags"))
+            matched = next((tag for tag in question_tags if tag.lower() in tag_set), None)
+            if matched is None:
+                continue
+            if not stackoverflow_dump_is_code_analysis_question(row):
+                continue
+            if since_date is not None and parse_stackoverflow_dump_date(row.get("CreationDate")) < since_date:
+                continue
+            if int(row.get("Score") or 0) < min_score:
+                continue
+            if int(row.get("AnswerCount") or 0) < min_answers:
+                continue
+            questions[question_id] = row
+            matching_tags[question_id] = matched
+        elif row.get("PostTypeId") == "2":
+            scanned_answers += 1
+            parent_id = row.get("ParentId")
+            if not parent_id:
+                continue
+            bucket = answers.setdefault(parent_id, [])
+            bucket.append(row)
+            bucket.sort(key=lambda answer: int(answer.get("Score") or 0), reverse=True)
+            del bucket[max_answers:]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_path in output_dir.glob(f"{output_prefix}_shard_{shard_index:03d}_*.jsonl"):
+        stale_path.unlink()
+    written_records = 0
+    output_files: list[str] = []
+    batch: list[dict] = []
+    file_index = 1
+
+    def flush_batch() -> None:
+        nonlocal batch, file_index, written_records
+        if not batch:
+            return
+        output_path = stackoverflow_dump_shard_output_path(
+            output_dir,
+            output_prefix,
+            shard_index,
+            file_index,
+        )
+        with output_path.open("w", encoding="utf-8") as fp:
+            for record in batch:
+                fp.write(json.dumps(anonymize_record(record), ensure_ascii=False, separators=(",", ":")) + "\n")
+        output_files.append(output_path.name)
+        written_records += len(batch)
+        print(f"{shard_path.name}: wrote {len(batch)} records to {output_path}", flush=True)
+        file_index += 1
+        batch = []
+
+    for question_id in sorted(questions, key=lambda value: int(value)):
+        batch.append(
+            stackoverflow_dump_question_to_record(
+                questions[question_id],
+                answers.get(question_id, []),
+                matching_tag=matching_tags[question_id],
+            )
+        )
+        if len(batch) >= max(1, records_per_file):
+            flush_batch()
+    flush_batch()
+    print(
+        f"{shard_path.name}: done rows={scanned_rows} questions={scanned_questions} answers={scanned_answers} selected={len(questions)} written={written_records}",
+        flush=True,
+    )
+    return {
+        "shard": shard_index,
+        "path": shard_path.name,
+        "rows": scanned_rows,
+        "questions": scanned_questions,
+        "answers": scanned_answers,
+        "selected_questions": len(questions),
+        "records_written": written_records,
+        "output_files": output_files,
+    }
+
+
+def parse_stackoverflow_shard_index(path: Path) -> int:
+    match = re.search(r"shard_(\d+)\.jsonl$", path.name)
+    if not match:
+        return 0
+    return int(match.group(1))
+
+
+def process_stackoverflow_dump_shards(
+    shard_dir: Path,
+    output_dir: Path,
+    output_prefix: str,
+    tags: Sequence[str],
+    since: str,
+    min_score: int,
+    min_answers: int,
+    max_answers: int,
+    records_per_file: int,
+    workers: int,
+    progress_interval: int = 100_000,
+    reset_progress: bool = False,
+) -> dict:
+    shard_paths = sorted(shard_dir.glob("shard_*.jsonl"), key=parse_stackoverflow_shard_index)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict] = []
+    progress_file = stackoverflow_dump_from_shards_progress_path(output_dir)
+    progress = {"completed_shards": {}} if reset_progress else read_stackoverflow_dump_from_shards_progress(progress_file)
+    completed_shards = progress["completed_shards"]
+    skipped_results = []
+    for shard_path in shard_paths:
+        if shard_path.name not in completed_shards:
+            continue
+        completed_result = dict(completed_shards[shard_path.name])
+        completed_result.setdefault("shard", parse_stackoverflow_shard_index(shard_path))
+        completed_result.setdefault("path", shard_path.name)
+        completed_result.setdefault("records_written", 0)
+        completed_result.setdefault("output_files", [])
+        skipped_results.append(completed_result)
+    pending_shard_paths = [
+        shard_path
+        for shard_path in shard_paths
+        if shard_path.name not in completed_shards
+    ]
+    if not shard_paths:
+        summary = {
+            "shard_dir": str(shard_dir),
+            "output_dir": str(output_dir),
+            "shards_processed": 0,
+            "shards_skipped": 0,
+            "records_written": 0,
+            "files": [],
+        }
+        stackoverflow_dump_from_shards_summary_path(output_dir).write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return summary
+    worker_count = max(1, workers)
+    print(
+        f"Processing {len(pending_shard_paths)} Stack Overflow shards with workers={worker_count}; skipped {len(skipped_results)} completed shards",
+        flush=True,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_path = {
+            executor.submit(
+                process_stackoverflow_dump_shard,
+                shard_path,
+                parse_stackoverflow_shard_index(shard_path),
+                output_dir,
+                output_prefix,
+                tags,
+                since,
+                min_score,
+                min_answers,
+                max_answers,
+                records_per_file,
+                progress_interval,
+            ): shard_path
+            for shard_path in pending_shard_paths
+        }
+        for future in concurrent.futures.as_completed(future_to_path):
+            result = future.result()
+            results.append(result)
+            progress["completed_shards"][result["path"]] = result
+            write_stackoverflow_dump_from_shards_progress(progress_file, progress)
+            print(
+                f"Finished {result['path']}: records={result['records_written']} selected={result['selected_questions']}",
+                flush=True,
+            )
+    results.sort(key=lambda item: int(item["shard"]))
+    all_results = sorted(
+        [*skipped_results, *results],
+        key=lambda item: int(item["shard"]),
+    )
+    summary = {
+        "shard_dir": str(shard_dir),
+        "output_dir": str(output_dir),
+        "shards_processed": len(results),
+        "shards_skipped": len(skipped_results),
+        "records_written": sum(int(item["records_written"]) for item in all_results),
+        "files": all_results,
+    }
+    stackoverflow_dump_from_shards_summary_path(output_dir).write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"Processed {summary['shards_processed']} shards; wrote {summary['records_written']} records to {output_dir}",
+        flush=True,
+    )
+    print(f"Summary: {stackoverflow_dump_from_shards_summary_path(output_dir)}", flush=True)
+    return summary
 
 
 def read_stackoverflow_dump_checkpoint(path: Path) -> dict:
@@ -2827,6 +3111,31 @@ def stackoverflow_dump_shard_main(argv: Sequence[str] | None = None) -> int:
     )
     print(
         f"Wrote {manifest['rows_written']} Stack Overflow dump rows into {manifest['shards']} shards under {args.shard_dir}",
+        flush=True,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def stackoverflow_dump_from_shards_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_stackoverflow_dump_from_shards_args(argv)
+    start = time.time()
+    summary = process_stackoverflow_dump_shards(
+        shard_dir=Path(args.shard_dir),
+        output_dir=Path(args.output_dir),
+        output_prefix=args.output_prefix,
+        tags=args.tags,
+        since=args.since,
+        min_score=args.min_score,
+        min_answers=args.min_answers,
+        max_answers=args.max_answers,
+        records_per_file=args.records_per_file,
+        workers=args.workers,
+        progress_interval=args.progress_interval,
+        reset_progress=args.reset_progress,
+    )
+    print(
+        f"Wrote {summary['records_written']} Stack Overflow dump records from shards to {args.output_dir}",
         flush=True,
     )
     print(f"Done in {time.time() - start:.1f}s", flush=True)
