@@ -27,6 +27,7 @@ SOURCE_NAME = "GitHub"
 GITLAB_SOURCE_NAME = "GitLab"
 STACKOVERFLOW_SOURCE_NAME = "StackOverflow"
 GITLAB_BASE_URL = "https://gitlab.com"
+GITHUB_SEARCH_MAX_PAGES = 10
 GITLAB_PROJECTS_PER_PAGE = 10
 GITLAB_MAX_SEARCH_PAGES = 100
 TOKEN_CONFIG_PATH = "token.json"
@@ -137,7 +138,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate repositories per language.")
     parser.add_argument("--target-repos", type=int, default=100, help="Target total repositories to collect.")
     parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible repositories to process.")
-    parser.add_argument("--search-max-pages", type=int, default=10, help="Maximum GitHub Search API pages to scan per language while looking for new repositories.")
+    parser.add_argument(
+        "--search-max-pages",
+        type=int,
+        default=GITHUB_SEARCH_MAX_PAGES,
+        help="Maximum GitHub Search API pages to scan per language while looking for new repositories. GitHub search is capped at 10 pages.",
+    )
     parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
     parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
     parser.add_argument("--github-token", default=None, help="Optional GitHub token. Overrides token.json and GITHUB_TOKEN.")
@@ -699,10 +705,11 @@ def fetch_high_star_repos(
 ) -> list[RepoInfo]:
     repos: list[RepoInfo] = []
     seen: set[str] = set(existing_repo_names or set())
+    max_pages = min(max(1, search_max_pages), GITHUB_SEARCH_MAX_PAGES)
     for language in languages:
         page = 1
         language_selected = 0
-        while language_selected < repos_per_language and page <= max(1, search_max_pages):
+        while language_selected < repos_per_language and page <= max_pages:
             query = f"language:{language} stars:>{min_stars} archived:false mirror:false"
             params = urllib.parse.urlencode(
                 {
@@ -1400,8 +1407,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         if len(repos) < target_new_repos:
+            search_pages_scanned = min(max(1, args.search_max_pages), GITHUB_SEARCH_MAX_PAGES)
             print(
-                f"Warning: requested {target_new_repos} new repositories, but only found {len(repos)} after scanning up to {args.search_max_pages} pages per language.",
+                f"Warning: requested {target_new_repos} new repositories, but only found {len(repos)} after scanning up to {search_pages_scanned} pages per language.",
                 flush=True,
             )
         repos = read_repo_csv(repo_csv_path)

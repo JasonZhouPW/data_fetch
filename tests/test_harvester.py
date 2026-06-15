@@ -226,6 +226,42 @@ def test_fetch_high_star_repos_skips_existing_and_continues_pages(monkeypatch):
     assert len(calls) == 2
 
 
+def test_fetch_high_star_repos_caps_github_search_pages(monkeypatch):
+    calls: list[int] = []
+
+    def fake_github_get_json(url: str, github_token: str | None) -> dict:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        calls.append(int(query["page"][0]))
+        return {
+            "items": [
+                {
+                    "full_name": "owner/existing",
+                    "clone_url": "https://github.com/owner/existing.git",
+                    "html_url": "https://github.com/owner/existing",
+                    "language": "Go",
+                    "stargazers_count": 20_000,
+                    "description": "Existing production server.",
+                    "topics": ["server"],
+                    "pushed_at": "",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(harvester, "github_get_json", fake_github_get_json)
+
+    repos = fetch_high_star_repos(
+        languages=["Go"],
+        min_stars=5_000,
+        repos_per_language=1,
+        max_repos=1,
+        existing_repo_names={"owner/existing"},
+        search_max_pages=100,
+    )
+
+    assert repos == []
+    assert calls == list(range(1, 11))
+
+
 def test_filter_unfinished_repos_skips_finished_csv_records():
     done_repo = RepoInfo(
         full_name="owner/done",
