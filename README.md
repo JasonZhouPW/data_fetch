@@ -245,6 +245,68 @@ GitLab 专用参数：
 
 其他参数与 GitHub 入口含义一致，包括 `--output-dir`、`--work-dir`、`--commit-work-dir`、`--repo-csv`、`--refresh-repo-csv`、`--append-repo-csv`、`--since`、`--languages`、`--min-stars`、`--repos-per-language`、`--target-repos`、`--max-repos`、`--workers`、`--clone-workers`、`--keep-repos` 和 `--max-commits`。
 
+## Gitee 数据采集
+
+Gitee 入口同样复用 clone、commit 过滤和 JSONL 生成逻辑，输出格式与 GitHub/GitLab 数据一致；区别是 `meta.data_info.source` 会写为 `Gitee`。
+
+Gitee token 可在项目根目录配置 `token.json`：
+
+```json
+{
+  "gitee": "gitee_access_token"
+}
+```
+
+Gitee token 读取优先级为：命令行参数 > `token.json` > 环境变量 `GITEE_TOKEN`。指定项目处理可以不传 token；批量搜索建议配置 token，因为 Gitee 公开搜索 API 对未授权请求可能返回空列表或受限结果。
+
+使用 `--append-repo-csv` 时，脚本会从 Gitee 搜索结果中跳过 CSV 里已存在的项目，并继续向后翻页寻找新的项目。每种语言最多翻到 `min(100, max(10, --repos-per-language))` 页。如果 Gitee 搜索 API 返回空列表，脚本会自动 fallback 到一组默认公开组织仓库列表继续发现项目：`dromara`、`openeuler`、`mindspore`、`openharmony`、`openkylin`。fallback 仍然只保留公开项目，并继续按 `--min-stars`、语言和教学/示例关键词过滤。
+
+完整启动命令示例：
+
+```bash
+python3 -m gitee_code_harvester \
+  --append-repo-csv \
+  --output-dir final_data_gitee \
+  --work-dir .cache/gitee_repos \
+  --commit-work-dir .cache/gitee_commit_json \
+  --repo-csv gitee_group_repo.csv \
+  --since 2025-10-01 \
+  --languages Go Java Python JavaScript C++ \
+  --min-stars 20 \
+  --repos-per-language 2000 \
+  --target-repos 1000 \
+  --max-repos 1000 \
+  --clone-workers 2 \
+  --workers 10
+```
+
+处理指定 Gitee 项目：
+
+```bash
+python3 -m gitee_code_harvester \
+  --repo owner/project \
+  --output-dir final_data_gitee \
+  --repo-csv gitee_group_repo.csv \
+  --work-dir .cache/test_gitee_repos \
+  --commit-work-dir .cache/test_gitee_commit_json \
+  --since 2025-10-01 \
+  --max-commits 3 \
+  --clone-workers 1 \
+  --workers 1
+```
+
+Gitee 专用参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--gitee-api-base-url` | `https://gitee.com/api/v5` 或环境变量 `GITEE_API_BASE_URL` | Gitee API 地址。 |
+| `--gitee-token` | `token.json` 的 `gitee` 字段，或环境变量 `GITEE_TOKEN` | Gitee API access token；命令行参数优先级最高。 |
+| `--gitee-seed-org` | 默认内置常见公开组织 | 可选。当 Gitee 搜索 API 返回空列表时，额外扫描指定组织的公开仓库；可重复传入。 |
+| `--gitee-seed-user` | 空 | 可选。当 Gitee 搜索 API 返回空列表时，额外扫描指定用户的公开仓库；可重复传入。 |
+| `--repo` | 空 | 指定 Gitee 项目路径，可重复传入，例如 `--repo owner/project --repo group/project`。 |
+
+其他参数与 GitHub/GitLab 入口含义一致。
+
 ## 技术讨论数据采集
 
 新增 `discussion_harvester` 入口，用于采集代码相关的技术问答和深度讨论数据。当前先支持 Stack Overflow，因为 Stack Exchange 提供官方 API，并且内容许可证清晰；Reddit 和 CSDN 暂不默认采集正文，原因是 API/版权限制更强，建议拿到授权后再接入。

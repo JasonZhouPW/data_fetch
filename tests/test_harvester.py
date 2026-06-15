@@ -17,9 +17,12 @@ from github_code_harvester.harvester import (
     clone_or_update_repo,
     cleanup_project_workspace,
     failed_log_main,
+    fetch_gitee_project,
+    fetch_high_star_gitee_projects,
     fetch_high_star_repos,
     fetch_gitlab_project,
     fetch_high_star_gitlab_projects,
+    gitee_project_to_repo,
     gitlab_project_to_repo,
     ensure_repo_csv_finished_field,
     is_code_commit,
@@ -1309,6 +1312,222 @@ def test_fetch_high_star_gitlab_projects_continues_beyond_ten_pages_when_needed(
     assert len(repos) == 11
     assert repos[-1].full_name == "group/service-11"
     assert len(calls) == 11
+
+
+def test_gitee_project_to_repo_maps_common_fields():
+    repo = gitee_project_to_repo(
+        {
+            "full_name": "owner/service",
+            "clone_url": "https://gitee.com/owner/service.git",
+            "html_url": "https://gitee.com/owner/service",
+            "language": "Python",
+            "stars_count": 1200,
+            "description": "Production backend service.",
+            "tags": ["api"],
+            "pushed_at": "2026-01-02T03:04:05+08:00",
+        }
+    )
+
+    assert repo.full_name == "owner/service"
+    assert repo.clone_url == "https://gitee.com/owner/service.git"
+    assert repo.source == "Gitee"
+    assert repo.stargazers_count == 1200
+    assert repo.topics == ["api"]
+
+
+def test_gitee_project_to_repo_handles_git_html_url():
+    repo = gitee_project_to_repo(
+        {
+            "full_name": "owner/service",
+            "html_url": "https://gitee.com/owner/service.git",
+            "stargazers_count": 1200,
+            "description": "Production backend service.",
+        }
+    )
+
+    assert repo.html_url == "https://gitee.com/owner/service"
+    assert repo.clone_url == "https://gitee.com/owner/service.git"
+
+
+def test_fetch_gitee_project_uses_repo_endpoint(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_get_json(url: str, token: str | None) -> dict:
+        seen["url"] = url
+        seen["token"] = token
+        return {
+            "full_name": "owner/service",
+            "html_url": "https://gitee.com/owner/service",
+            "stars_count": 1200,
+            "description": "Production backend service.",
+        }
+
+    monkeypatch.setattr(harvester, "gitee_get_json", fake_get_json)
+
+    repo = fetch_gitee_project(
+        "owner/service",
+        gitee_api_base_url="https://gitee.com/api/v5",
+        gitee_token="token",
+    )
+
+    assert repo.full_name == "owner/service"
+    assert seen == {
+        "url": "https://gitee.com/api/v5/repos/owner/service",
+        "token": "token",
+    }
+
+
+def test_fetch_high_star_gitee_projects_filters_and_skips_existing(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(url: str, token: str | None) -> list[dict]:
+        calls.append(url)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if query["page"] == ["1"]:
+            return [
+                {
+                    "full_name": "owner/existing",
+                    "html_url": "https://gitee.com/owner/existing",
+                    "language": "Go",
+                    "stars_count": 2000,
+                    "description": "Production backend service.",
+                },
+                {
+                    "full_name": "owner/tutorial",
+                    "html_url": "https://gitee.com/owner/tutorial",
+                    "language": "Go",
+                    "stars_count": 2000,
+                    "description": "Tutorial examples.",
+                },
+            ]
+        return [
+            {
+                "full_name": "owner/service",
+                "html_url": "https://gitee.com/owner/service",
+                "language": "Go",
+                "stars_count": 1800,
+                "description": "Production backend service.",
+            }
+        ]
+
+    monkeypatch.setattr(harvester, "gitee_get_json", fake_get_json)
+
+    repos = fetch_high_star_gitee_projects(
+        languages=["Go"],
+        min_stars=100,
+        repos_per_language=1,
+        gitee_api_base_url="https://gitee.com/api/v5",
+        gitee_token=None,
+        max_repos=1,
+        existing_repo_names={"owner/existing"},
+    )
+
+    assert [repo.full_name for repo in repos] == ["owner/service"]
+    assert len(calls) == 2
+    first_query = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)
+    assert first_query["q"] == ["Go"]
+    assert first_query["language"] == ["Go"]
+    assert first_query["sort"] == ["stars_count"]
+
+
+def test_fetch_high_star_gitee_projects_falls_back_to_seed_orgs(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(url: str, token: str | None) -> list[dict]:
+        calls.append(url)
+        if "/search/repositories" in url:
+            return []
+        return [
+            {
+                "full_name": "dromara/service",
+                "html_url": "https://gitee.com/dromara/service.git",
+                "language": "Java",
+                "stargazers_count": 1800,
+                "description": "Production backend service.",
+                "fork": False,
+                "private": False,
+            },
+            {
+                "full_name": "dromara/tutorial",
+                "html_url": "https://gitee.com/dromara/tutorial.git",
+                "language": "Java",
+                "stargazers_count": 2000,
+                "description": "Tutorial examples.",
+                "fork": False,
+                "private": False,
+            },
+        ]
+
+    monkeypatch.setattr(harvester, "gitee_get_json", fake_get_json)
+
+    repos = fetch_high_star_gitee_projects(
+        languages=["Java"],
+        min_stars=100,
+        repos_per_language=1,
+        gitee_api_base_url="https://gitee.com/api/v5",
+        gitee_token="token",
+        max_repos=1,
+        seed_orgs=["dromara"],
+        seed_users=[],
+    )
+
+    assert [repo.full_name for repo in repos] == ["dromara/service"]
+    assert any("/orgs/dromara/repos" in call for call in calls)
+
+
+def test_gitee_get_json_appends_access_token(monkeypatch):
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": true}'
+
+    def fake_urlopen(request, timeout: int):
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(harvester.urllib.request, "urlopen", fake_urlopen)
+
+    assert harvester.gitee_get_json("https://gitee.com/api/v5/repos/search?q=Go", "token") == {"ok": True}
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(str(seen["url"])).query)
+    assert query["access_token"] == ["token"]
+    assert seen["timeout"] == 60
+
+
+def test_repo_has_commit_since_via_api_uses_latest_gitee_commit_date(monkeypatch):
+    repo = RepoInfo(
+        full_name="owner/recent",
+        clone_url="https://gitee.com/owner/recent.git",
+        html_url="https://gitee.com/owner/recent",
+        language="Go",
+        stargazers_count=10_000,
+        description="Recent repo.",
+        topics=[],
+        pushed_at="",
+        source="Gitee",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_gitee_get_json(url: str, token: str | None) -> list[dict]:
+        seen["url"] = url
+        seen["token"] = token
+        return [{"commit": {"author": {"date": "2025-11-02T03:04:05+08:00"}}}]
+
+    monkeypatch.setattr(harvester, "gitee_get_json", fake_gitee_get_json)
+    monkeypatch.setattr(harvester, "resolve_token", lambda explicit, provider, env_name: "gitee-token")
+
+    assert repo_has_commit_since_via_api(repo, "2025-10-01") is True
+    assert seen == {
+        "url": "https://gitee.com/api/v5/repos/owner/recent/commits?per_page=1",
+        "token": "gitee-token",
+    }
 
 
 def test_write_jsonl_for_commit_writes_one_record_with_all_code(tmp_path: Path):

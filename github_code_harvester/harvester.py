@@ -25,11 +25,16 @@ LANGUAGES = ("Go", "Java", "Python", "JavaScript", "C++")
 SINCE_DATE = "2025-10-01"
 SOURCE_NAME = "GitHub"
 GITLAB_SOURCE_NAME = "GitLab"
+GITEE_SOURCE_NAME = "Gitee"
 STACKOVERFLOW_SOURCE_NAME = "StackOverflow"
 GITLAB_BASE_URL = "https://gitlab.com"
+GITEE_API_BASE_URL = "https://gitee.com/api/v5"
 GITHUB_SEARCH_MAX_PAGES = 10
 GITLAB_PROJECTS_PER_PAGE = 10
 GITLAB_MAX_SEARCH_PAGES = 100
+GITEE_REPOS_PER_PAGE = 100
+GITEE_MAX_SEARCH_PAGES = 100
+GITEE_DEFAULT_SEED_ORGS = ("dromara", "openeuler", "mindspore", "openharmony", "openkylin")
 TOKEN_CONFIG_PATH = "token.json"
 STACKEXCHANGE_API_BASE_URL = "https://api.stackexchange.com/2.3"
 DISCUSSION_TAGS = ("python", "java", "javascript", "go", "c++")
@@ -175,6 +180,34 @@ def parse_gitlab_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gitlab-token", default=None, help="Optional GitLab token. GitLab does not read token.json by default.")
     parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
     parser.add_argument("--repo", action="append", default=[], help="Process an explicit GitLab project path, e.g. group/subgroup/project.")
+    parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
+    return parser.parse_args(argv)
+
+
+def parse_gitee_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch high-star Gitee projects and generate per-project JSONL code snapshots."
+    )
+    parser.add_argument("--output-dir", default="final_data_gitee", help="Directory for final per-repo JSONL files.")
+    parser.add_argument("--work-dir", default=".cache/gitee_repos", help="Directory for cloned repositories.")
+    parser.add_argument("--commit-work-dir", default=".cache/gitee_commit_json", help="Directory for intermediate commit JSON files.")
+    parser.add_argument("--repo-csv", default="gitee_group_repo.csv", help="CSV path for selected repositories.")
+    parser.add_argument("--refresh-repo-csv", action="store_true", help="Ignore an existing repo CSV and fetch a fresh repository list.")
+    parser.add_argument("--append-repo-csv", action="store_true", help="Fetch new repositories not already in repo CSV, append them, and process the CSV.")
+    parser.add_argument("--since", default=SINCE_DATE, help="Only read commits after this date, YYYY-MM-DD.")
+    parser.add_argument("--languages", nargs="+", default=list(LANGUAGES), help="Gitee programming languages to search.")
+    parser.add_argument("--min-stars", type=int, default=50, help="Minimum stars for project candidates.")
+    parser.add_argument("--repos-per-language", type=int, default=100, help="Candidate projects per language.")
+    parser.add_argument("--target-repos", type=int, default=100, help="Target total projects to collect.")
+    parser.add_argument("--max-repos", type=int, default=None, help="Maximum eligible projects to process.")
+    parser.add_argument("--workers", type=int, default=10, help="Commit JSON worker threads.")
+    parser.add_argument("--clone-workers", type=int, default=1, help="Clone worker threads.")
+    parser.add_argument("--gitee-api-base-url", default=os.getenv("GITEE_API_BASE_URL", GITEE_API_BASE_URL), help="Gitee API base URL.")
+    parser.add_argument("--gitee-token", default=None, help="Optional Gitee access token. Overrides token.json and GITEE_TOKEN.")
+    parser.add_argument("--gitee-seed-org", action="append", default=[], help="Gitee organization path to scan when search returns no projects. Can be repeated.")
+    parser.add_argument("--gitee-seed-user", action="append", default=[], help="Gitee username to scan when search returns no projects. Can be repeated.")
+    parser.add_argument("--keep-repos", action="store_true", help="Keep cloned repositories after processing.")
+    parser.add_argument("--repo", action="append", default=[], help="Process an explicit Gitee project path, e.g. owner/name.")
     parser.add_argument("--max-commits", type=int, default=None, help="Maximum commits to process per repository.")
     return parser.parse_args(argv)
 
@@ -767,6 +800,18 @@ def fetch_repo(repo_name: str, github_token: str | None = None) -> RepoInfo:
     )
 
 
+def fetch_gitee_project(
+    repo_name: str,
+    gitee_api_base_url: str = GITEE_API_BASE_URL,
+    gitee_token: str | None = None,
+) -> RepoInfo:
+    encoded = urllib.parse.quote(repo_name.strip(), safe="/")
+    item = gitee_get_json(f"{normalize_base_url(gitee_api_base_url)}/repos/{encoded}", gitee_token)
+    if not isinstance(item, dict):
+        raise ValueError(f"Unexpected Gitee project payload for {repo_name}")
+    return gitee_project_to_repo(item)
+
+
 def normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
@@ -786,6 +831,213 @@ def gitlab_project_to_repo(item: dict, language: str | None = None) -> RepoInfo:
         topics=list(topics or []),
         pushed_at=item.get("last_activity_at") or item.get("updated_at") or "",
         source=GITLAB_SOURCE_NAME,
+    )
+
+
+def gitee_project_to_repo(item: dict, language: str | None = None) -> RepoInfo:
+    owner = item.get("owner") or item.get("namespace") or {}
+    owner_path = owner.get("path") or owner.get("login") or owner.get("name") or ""
+    repo_path = item.get("path") or item.get("name") or ""
+    full_name = (
+        item.get("full_name")
+        or item.get("human_name")
+        or item.get("path_with_namespace")
+        or (f"{owner_path}/{repo_path}" if owner_path and repo_path else repo_path)
+    )
+    raw_html_url = str(item.get("html_url") or item.get("url") or f"https://gitee.com/{full_name}")
+    html_url = raw_html_url[:-4] if raw_html_url.endswith(".git") else raw_html_url
+    clone_url = (
+        item.get("clone_url")
+        or item.get("html_url_to_repo")
+        or item.get("http_url_to_repo")
+        or (raw_html_url if raw_html_url.endswith(".git") else f"{html_url.rstrip('/')}.git")
+    )
+    topics = item.get("topics") or item.get("tags") or []
+    if isinstance(topics, str):
+        topics = [topics]
+    return RepoInfo(
+        full_name=str(full_name).strip(),
+        clone_url=str(clone_url),
+        html_url=str(html_url),
+        language=item.get("language") or language or "unknown",
+        stargazers_count=int(item.get("stars_count") or item.get("stargazers_count") or item.get("watchers_count") or 0),
+        description=item.get("description") or "",
+        topics=list(topics or []),
+        pushed_at=item.get("pushed_at") or item.get("updated_at") or "",
+        source=GITEE_SOURCE_NAME,
+    )
+
+
+def append_query_param(url: str, name: str, value: str | None) -> str:
+    if not value:
+        return url
+    separator = "&" if urllib.parse.urlparse(url).query else "?"
+    return f"{url}{separator}{urllib.parse.urlencode({name: value})}"
+
+
+def is_gitee_search_candidate(item: dict, language: str, min_stars: int) -> bool:
+    if bool(item.get("private")):
+        return False
+    if bool(item.get("fork")):
+        return False
+    stars = int(item.get("stars_count") or item.get("stargazers_count") or item.get("watchers_count") or 0)
+    if stars <= min_stars:
+        return False
+    item_language = item.get("language")
+    if item_language and str(item_language).lower() != language.lower():
+        return False
+    return True
+
+
+def fetch_gitee_owner_repos(
+    owner: str,
+    owner_type: str,
+    gitee_api_base_url: str,
+    gitee_token: str | None,
+    max_pages: int,
+) -> list[dict]:
+    base_url = normalize_base_url(gitee_api_base_url)
+    encoded_owner = urllib.parse.quote(owner.strip(), safe="")
+    items: list[dict] = []
+    for page in range(1, max_pages + 1):
+        if owner_type == "org":
+            path = f"{base_url}/orgs/{encoded_owner}/repos"
+            params = {
+                "type": "public",
+                "per_page": GITEE_REPOS_PER_PAGE,
+                "page": page,
+            }
+        else:
+            path = f"{base_url}/users/{encoded_owner}/repos"
+            params = {
+                "type": "all",
+                "sort": "pushed",
+                "direction": "desc",
+                "per_page": GITEE_REPOS_PER_PAGE,
+                "page": page,
+            }
+        url = f"{path}?{urllib.parse.urlencode(params)}"
+        try:
+            payload = gitee_get_json(url, gitee_token)
+        except Exception as exc:
+            print(f"Gitee seed {owner_type} {owner}: API request failed ({exc}); skipping", flush=True)
+            break
+        if not isinstance(payload, list) or not payload:
+            break
+        items.extend(item for item in payload if isinstance(item, dict))
+        if len(payload) < GITEE_REPOS_PER_PAGE:
+            break
+    return items
+
+
+def fetch_gitee_seed_projects(
+    languages: Sequence[str],
+    min_stars: int,
+    repos_per_language: int,
+    gitee_api_base_url: str,
+    gitee_token: str | None,
+    max_repos: int | None,
+    existing_repo_names: set[str] | None,
+    seed_orgs: Sequence[str],
+    seed_users: Sequence[str],
+) -> list[RepoInfo]:
+    repos: list[RepoInfo] = []
+    seen: set[str] = set(existing_repo_names or set())
+    language_set = {language.lower() for language in languages}
+    seeds = [("org", org) for org in seed_orgs] + [("user", user) for user in seed_users]
+    max_pages = min(GITEE_MAX_SEARCH_PAGES, max(1, repos_per_language // max(1, GITEE_REPOS_PER_PAGE) + 1))
+    for owner_type, owner in seeds:
+        owner_items = fetch_gitee_owner_repos(
+            owner=owner,
+            owner_type=owner_type,
+            gitee_api_base_url=gitee_api_base_url,
+            gitee_token=gitee_token,
+            max_pages=max_pages,
+        )
+        candidates = []
+        for item in owner_items:
+            if bool(item.get("private")):
+                continue
+            if item.get("public") is False:
+                continue
+            stars = int(item.get("stars_count") or item.get("stargazers_count") or item.get("watchers_count") or 0)
+            if stars <= min_stars:
+                continue
+            item_language = item.get("language")
+            if item_language and str(item_language).lower() not in language_set:
+                continue
+            candidates.append(gitee_project_to_repo(item, language=item_language or "unknown"))
+        candidates.sort(key=lambda repo: repo.stargazers_count, reverse=True)
+        selected = select_eligible_repos(candidates, max_repos=max_repos, seen=seen)
+        repos.extend(selected)
+        if max_repos is not None and len(repos) >= max_repos:
+            return repos[:max_repos]
+    repos.sort(key=lambda repo: repo.stargazers_count, reverse=True)
+    return repos[:max_repos] if max_repos is not None else repos
+
+
+def fetch_high_star_gitee_projects(
+    languages: Sequence[str],
+    min_stars: int,
+    repos_per_language: int,
+    gitee_api_base_url: str = GITEE_API_BASE_URL,
+    gitee_token: str | None = None,
+    max_repos: int | None = None,
+    existing_repo_names: set[str] | None = None,
+    seed_orgs: Sequence[str] | None = None,
+    seed_users: Sequence[str] | None = None,
+) -> list[RepoInfo]:
+    repos: list[RepoInfo] = []
+    seen: set[str] = set(existing_repo_names or set())
+    base_url = normalize_base_url(gitee_api_base_url)
+    max_pages = min(GITEE_MAX_SEARCH_PAGES, max(10, repos_per_language))
+    for language in languages:
+        page = 1
+        language_selected = 0
+        while language_selected < repos_per_language and page <= max_pages:
+            params = urllib.parse.urlencode(
+                {
+                    "q": language,
+                    "language": language,
+                    "sort": "stars_count",
+                    "order": "desc",
+                    "per_page": GITEE_REPOS_PER_PAGE,
+                    "page": page,
+                }
+            )
+            payload = gitee_get_json(f"{base_url}/search/repositories?{params}", gitee_token)
+            items = payload.get("items", payload) if isinstance(payload, dict) else payload
+            if not isinstance(items, list) or not items:
+                break
+            candidates = [
+                gitee_project_to_repo(item, language=language)
+                for item in items
+                if is_gitee_search_candidate(item, language, min_stars)
+            ]
+            remaining_for_language = repos_per_language - language_selected
+            remaining_total = None if max_repos is None else max_repos - len(repos)
+            limit = remaining_for_language
+            if remaining_total is not None:
+                limit = min(limit, remaining_total)
+            selected = select_eligible_repos(candidates, max_repos=limit, seen=seen)
+            repos.extend(selected)
+            language_selected += len(selected)
+            if max_repos is not None and len(repos) >= max_repos:
+                return repos
+            page += 1
+    if repos:
+        return repos
+    fallback_seed_orgs = tuple(seed_orgs or GITEE_DEFAULT_SEED_ORGS)
+    return fetch_gitee_seed_projects(
+        languages=languages,
+        min_stars=min_stars,
+        repos_per_language=repos_per_language,
+        gitee_api_base_url=gitee_api_base_url,
+        gitee_token=gitee_token,
+        max_repos=max_repos,
+        existing_repo_names=existing_repo_names,
+        seed_orgs=fallback_seed_orgs,
+        seed_users=tuple(seed_users or ()),
     )
 
 
@@ -896,6 +1148,26 @@ def fetch_latest_commit_date_via_api(repo: RepoInfo) -> dt.datetime | None:
         if not date_value:
             return None
         return dt.datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
+    if "gitee" in host:
+        gitee_token = resolve_token(None, "gitee", "GITEE_TOKEN")
+        project_path = repo.full_name.strip()
+        encoded = urllib.parse.quote(project_path, safe="/")
+        base_url = f"{urllib.parse.urlparse(repo.html_url).scheme}://{host}/api/v5"
+        payload = gitee_get_json(f"{base_url}/repos/{encoded}/commits?per_page=1", gitee_token)
+        items = payload.get("items", payload) if isinstance(payload, dict) else payload
+        if not isinstance(items, list) or not items:
+            return None
+        commit = items[0].get("commit") or {}
+        author = commit.get("author") if isinstance(commit, dict) else {}
+        date_value = (
+            items[0].get("committed_date")
+            or items[0].get("created_at")
+            or items[0].get("date")
+            or (author or {}).get("date")
+        )
+        if not date_value:
+            return None
+        return dt.datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
     return None
 
 
@@ -908,6 +1180,17 @@ def github_get_json(url: str, github_token: str | None) -> dict:
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
     request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def gitee_get_json(url: str, gitee_token: str | None) -> dict | list:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "gitee-code-harvester",
+    }
+    request_url = append_query_param(url, "access_token", gitee_token)
+    request = urllib.request.Request(request_url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -1495,6 +1778,79 @@ def gitlab_main(argv: Sequence[str] | None = None) -> int:
             gitlab_base_url=args.gitlab_base_url,
             gitlab_token=gitlab_token,
             max_repos=max_repos,
+        )
+    print(f"Selected {len(repos)} projects", flush=True)
+    if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
+        write_repo_csv(repos, repo_csv_path)
+        print(f"Wrote repo CSV to {args.repo_csv}", flush=True)
+    run_pipeline(
+        repos=repos,
+        work_dir=Path(args.work_dir),
+        output_dir=output_dir,
+        commit_work_dir=Path(args.commit_work_dir),
+        since=args.since,
+        jsonl_workers=max(1, args.workers),
+        clone_workers=max(1, args.clone_workers),
+        keep_repos=args.keep_repos,
+        max_commits=args.max_commits,
+        repo_csv_path=repo_csv_path,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def gitee_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_gitee_args(argv)
+    start = time.time()
+    repo_csv_path = Path(args.repo_csv)
+    output_dir = Path(args.output_dir)
+    ensure_repo_csv_finished_field(repo_csv_path)
+    gitee_token = resolve_token(args.gitee_token, "gitee", "GITEE_TOKEN")
+    if args.repo:
+        repos = [
+            fetch_gitee_project(
+                repo_name,
+                gitee_api_base_url=args.gitee_api_base_url,
+                gitee_token=gitee_token,
+            )
+            for repo_name in args.repo
+        ]
+    elif args.append_repo_csv:
+        existing = read_repo_csv(repo_csv_path) if repo_csv_path.exists() else []
+        existing_names = {repo.full_name for repo in existing}
+        target_new_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_gitee_projects(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            gitee_api_base_url=args.gitee_api_base_url,
+            gitee_token=gitee_token,
+            max_repos=target_new_repos,
+            existing_repo_names=existing_names,
+            seed_orgs=args.gitee_seed_org or GITEE_DEFAULT_SEED_ORGS,
+            seed_users=args.gitee_seed_user,
+        )
+        repos = append_repo_csv(repos, repo_csv_path)
+        print(
+            f"Appended {len(repos)} new projects to {args.repo_csv}; existing count was {len(existing)}",
+            flush=True,
+        )
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} total projects from {args.repo_csv}", flush=True)
+    elif repo_csv_path.exists() and not args.refresh_repo_csv:
+        repos = read_repo_csv(repo_csv_path)
+        print(f"Loaded {len(repos)} projects from {args.repo_csv}", flush=True)
+    else:
+        max_repos = args.max_repos if args.max_repos is not None else args.target_repos
+        repos = fetch_high_star_gitee_projects(
+            languages=args.languages,
+            min_stars=args.min_stars,
+            repos_per_language=args.repos_per_language,
+            gitee_api_base_url=args.gitee_api_base_url,
+            gitee_token=gitee_token,
+            max_repos=max_repos,
+            seed_orgs=args.gitee_seed_org or GITEE_DEFAULT_SEED_ORGS,
+            seed_users=args.gitee_seed_user,
         )
     print(f"Selected {len(repos)} projects", flush=True)
     if args.repo or args.refresh_repo_csv or (not args.append_repo_csv and not repo_csv_path.exists()):
