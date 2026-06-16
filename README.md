@@ -533,12 +533,12 @@ python3 -m discussion_harvester stackoverflow-dump \
   --tags python java javascript go c++ \
   --min-score 10 \
   --min-answers 10 \
-  --max-answers 5 \
+  --max-answers 10 \
   --records-per-file 500 \
   --progress-interval 100000
 ```
 
-该入口默认产出“代码分析与解释”类数据：只保留编程语言 tag 命中的 question，并要求 question 正文包含代码块、函数调用、赋值、异常/报错、SQL/函数定义等明显代码分析形态；泛泛的职业建议、语言选择、非代码讨论会被跳过。默认要求 question 的 score 不低于 10、answer 数不少于 10，并合并分数最高的 5 条回答，适合做代码解释/问题分析数据。默认不限制总记录数，会一直顺序处理到 `Posts.xml` 结束；如需测试小样本，可显式传 `--max-records 1000`。
+该入口只保留指定编程语言 tag 命中的 question。默认要求 question 的 score 不低于 10、answer 数不少于 10，并合并分数最高的 10 条回答。默认不限制总记录数，会一直顺序处理到 `Posts.xml` 结束；如需测试小样本，可显式传 `--max-records 1000`。
 
 输出文件按 500 条一份递增生成：
 
@@ -570,11 +570,11 @@ dump 参数：
 | `--min-score` | `10` | 问题最低 score。 |
 | `--min-answers` | `10` | 问题最低 answer 数。 |
 | `--max-records` | `0` | 最多写入的问题记录数；`0` 表示不限制，处理到 dump 结束。 |
-| `--max-answers` | `5` | 每个问题最多合并的最高赞 answers 数。 |
+| `--max-answers` | `10` | 每个问题最多合并的最高赞 answers 数。 |
 | `--records-per-file` | `500` | 每个 JSONL 文件的记录数。 |
 | `--progress-interval` | `100000` | 每扫描多少行 `Posts.xml` 打印一次进度。 |
 
-实现上会扫描 `Posts.xml` 两遍：第一遍从 checkpoint 记录的 question id 后继续顺序筛出符合条件的代码分析/解释类 question，第二遍只收集这些 question 的最高赞 answers，然后按批次写出 JSONL。每扫描 `--progress-interval` 行会打印当前扫描进度，每写完一个 JSONL 文件就更新 checkpoint。
+实现上会扫描 `Posts.xml` 两遍：第一遍从 checkpoint 记录的 question id 后继续顺序筛出符合条件的 question，第二遍只收集这些 question 的最高赞 answers，然后按批次写出 JSONL。每扫描 `--progress-interval` 行会打印当前扫描进度，每写完一个 JSONL 文件就更新 checkpoint。
 
 如果要先把超大的 `Posts.xml` 拆成可并行处理的小文件，可以使用专门的 question id 范围分片入口：
 
@@ -622,7 +622,7 @@ PYTHONPATH=. python3 -m discussion_harvester stackoverflow-dump-from-shards \
   --tags python java javascript go c++ \
   --min-score 10 \
   --min-answers 10 \
-  --max-answers 5 \
+  --max-answers 10 \
   --records-per-file 500 \
   --workers 10 \
   --progress-interval 100000
@@ -644,7 +644,7 @@ final_data_stackoverflow_dump/stackoverflow_dump_from_shards.summary.json
 --reset-progress
 ```
 
-处理规则与直接处理 `Posts.xml` 的入口保持一致：只保留符合 tag、score、answer 数和代码分析形态的问题，并为每个问题合并分数最高的 5 条回答。`--workers` 控制并发线程数，建议先用 `10`。
+处理规则与直接处理 `Posts.xml` 的入口保持一致：只保留符合 tag、score 和 answer 数的问题，并为每个问题合并分数最高的 10 条回答。`--workers` 控制并发线程数，建议先用 `10`。
 
 CSDN 公开文章采集示例：
 

@@ -61,7 +61,6 @@ from github_code_harvester.harvester import (
     stackoverflow_dump_from_shards_main,
     stackoverflow_dump_shard_main,
     stackoverflow_dump_shard_path,
-    stackoverflow_dump_is_code_analysis_question,
     stackoverflow_dump_main,
     stackoverflow_dump_question_to_record,
     stackoverflow_question_to_record,
@@ -1165,7 +1164,7 @@ def test_parse_stackoverflow_dump_args_sets_streaming_defaults():
     assert args.since == ""
     assert args.min_answers == 10
     assert args.max_records == 0
-    assert args.max_answers == 5
+    assert args.max_answers == 10
     assert args.records_per_file == 500
     assert args.progress_interval == 100_000
 
@@ -1189,7 +1188,7 @@ def test_parse_stackoverflow_dump_from_shards_args_defaults_to_parallel_workers(
     assert args.since == ""
     assert args.min_score == 10
     assert args.min_answers == 10
-    assert args.max_answers == 5
+    assert args.max_answers == 10
     assert args.records_per_file == 500
     assert args.workers == 10
     assert args.reset_progress is False
@@ -1282,16 +1281,17 @@ def test_write_stackoverflow_dump_jsonl_streams_posts_xml(tmp_path: Path):
     assert "Low score answer" not in rows[0]["text"]
 
 
-def test_stackoverflow_dump_filters_to_code_analysis_questions(tmp_path: Path):
+def test_stackoverflow_dump_keeps_tagged_questions_without_code_shape_filter(tmp_path: Path):
     posts_xml = tmp_path / "Posts.xml"
     posts_xml.write_text(
         """<?xml version="1.0" encoding="utf-8"?>
 <posts>
   <row Id="1" PostTypeId="1" CreationDate="2024-02-01T00:00:00.000" Score="25" ViewCount="1000" AnswerCount="3" Title="Python career question" Tags="&lt;python&gt;" Body="&lt;p&gt;What should I learn next?&lt;/p&gt;" />
   <row Id="2" PostTypeId="1" CreationDate="2024-02-02T00:00:00.000" Score="30" ViewCount="1000" AnswerCount="3" Title="Python list bug" Tags="&lt;python&gt;" Body="&lt;p&gt;Why does this code fail?&lt;/p&gt;&lt;pre&gt;&lt;code&gt;items.append(x)&lt;/code&gt;&lt;/pre&gt;" />
-  <row Id="3" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:01:00.000" Score="30" Body="&lt;p&gt;Because append mutates the list.&lt;/p&gt;" />
-  <row Id="4" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:02:00.000" Score="20" Body="&lt;p&gt;Return value is None.&lt;/p&gt;" />
-  <row Id="5" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:03:00.000" Score="10" Body="&lt;p&gt;Use a separate assignment.&lt;/p&gt;" />
+  <row Id="3" PostTypeId="2" ParentId="1" CreationDate="2024-02-01T00:01:00.000" Score="40" Body="&lt;p&gt;Try building a small project.&lt;/p&gt;" />
+  <row Id="4" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:01:00.000" Score="30" Body="&lt;p&gt;Because append mutates the list.&lt;/p&gt;" />
+  <row Id="5" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:02:00.000" Score="20" Body="&lt;p&gt;Return value is None.&lt;/p&gt;" />
+  <row Id="6" PostTypeId="2" ParentId="2" CreationDate="2024-02-02T00:03:00.000" Score="10" Body="&lt;p&gt;Use a separate assignment.&lt;/p&gt;" />
 </posts>
 """,
         encoding="utf-8",
@@ -1310,19 +1310,10 @@ def test_stackoverflow_dump_filters_to_code_analysis_questions(tmp_path: Path):
     )
 
     rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
-    assert written == 1
-    assert rows[0]["id"] == "stackoverflow_question_2"
-    assert "items.append(x)" in rows[0]["text"]
-    assert "What should I learn next" not in rows[0]["text"]
-
-
-def test_stackoverflow_dump_is_code_analysis_question_detects_code_shapes():
-    assert stackoverflow_dump_is_code_analysis_question(
-        {"Body": "<p>Why?</p><pre><code>print(value)</code></pre>", "Title": "Python error"}
-    )
-    assert not stackoverflow_dump_is_code_analysis_question(
-        {"Body": "<p>Which programming language should I learn?</p>", "Title": "Career advice"}
-    )
+    assert written == 2
+    assert [row["id"] for row in rows] == ["stackoverflow_question_1", "stackoverflow_question_2"]
+    assert "What should I learn next" in rows[0]["text"]
+    assert "items.append(x)" in rows[1]["text"]
 
 
 def test_write_stackoverflow_dump_jsonl_keeps_highest_score_answer_before_accepted(tmp_path: Path):
@@ -1569,7 +1560,7 @@ def test_process_stackoverflow_dump_shards_writes_jsonl_per_shard(tmp_path: Path
                         "AnswerCount": "10",
                         "Title": "Python one",
                         "Tags": "<python>",
-                        "Body": "<p>Question one</p><pre><code>print(one)</code></pre>",
+                        "Body": "<p>What should I learn next?</p>",
                     }
                 ),
                 json.dumps({"Id": "10", "PostTypeId": "2", "ParentId": "1", "Score": "1", "Body": "<p>Low</p>"}),

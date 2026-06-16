@@ -327,7 +327,7 @@ def parse_stackoverflow_dump_args(argv: Sequence[str] | None = None) -> argparse
     parser.add_argument("--min-score", type=int, default=10, help="Minimum question score.")
     parser.add_argument("--min-answers", type=int, default=10, help="Minimum answer count.")
     parser.add_argument("--max-records", type=int, default=0, help="Maximum question records to write. 0 means no limit.")
-    parser.add_argument("--max-answers", type=int, default=5, help="Maximum highest-score answers included per question.")
+    parser.add_argument("--max-answers", type=int, default=10, help="Maximum highest-score answers included per question.")
     parser.add_argument("--records-per-file", type=int, default=500, help="Number of records per output JSONL file.")
     parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed Posts.xml rows.")
     return parser.parse_args(argv)
@@ -356,7 +356,7 @@ def parse_stackoverflow_dump_from_shards_args(argv: Sequence[str] | None = None)
     parser.add_argument("--since", default="", help="Optional lower bound for question creation date, YYYY-MM-DD.")
     parser.add_argument("--min-score", type=int, default=10, help="Minimum question score.")
     parser.add_argument("--min-answers", type=int, default=10, help="Minimum answer count.")
-    parser.add_argument("--max-answers", type=int, default=5, help="Maximum highest-score answers included per question.")
+    parser.add_argument("--max-answers", type=int, default=10, help="Maximum highest-score answers included per question.")
     parser.add_argument("--records-per-file", type=int, default=500, help="Number of records per output JSONL file.")
     parser.add_argument("--workers", type=int, default=10, help="Number of shard worker threads.")
     parser.add_argument("--progress-interval", type=int, default=100_000, help="Print progress after this many parsed shard rows.")
@@ -1030,20 +1030,6 @@ def parse_stackoverflow_dump_date(value: str | None) -> dt.datetime:
     return parsed
 
 
-def stackoverflow_dump_is_code_analysis_question(question: dict[str, str]) -> bool:
-    body = question.get("Body") or ""
-    title = question.get("Title") or ""
-    if re.search(r"</?(pre|code)\b", body, re.I):
-        return True
-    text = html_to_text(f"{title}\n{body}")
-    return bool(
-        re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)", text)
-        or re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=", text)
-        or re.search(r"\b(class|def|function|return|import|select|insert|update|delete)\b", text, re.I)
-        or re.search(r"\b(error|exception|traceback|stack trace|null pointer|undefined)\b", text, re.I)
-    )
-
-
 def stackoverflow_dump_question_to_record(
     question: dict[str, str],
     answers: Sequence[dict[str, str]],
@@ -1306,8 +1292,6 @@ def select_stackoverflow_dump_questions(
         matched = next((tag for tag in question_tags if tag.lower() in tag_set), None)
         if matched is None:
             continue
-        if not stackoverflow_dump_is_code_analysis_question(row):
-            continue
         if since_date is not None and parse_stackoverflow_dump_date(row.get("CreationDate")) < since_date:
             continue
         if int(row.get("Score") or 0) < min_score:
@@ -1412,8 +1396,6 @@ def process_stackoverflow_dump_shard(
             question_tags = parse_stackoverflow_tags(row.get("Tags"))
             matched = next((tag for tag in question_tags if tag.lower() in tag_set), None)
             if matched is None:
-                continue
-            if not stackoverflow_dump_is_code_analysis_question(row):
                 continue
             if since_date is not None and parse_stackoverflow_dump_date(row.get("CreationDate")) < since_date:
                 continue
