@@ -561,6 +561,7 @@ def run_git(repo_dir: Path, args: Sequence[str], capture: bool = True) -> str:
         cwd=repo_dir,
         check=True,
         text=True,
+        env=git_noninteractive_env(),
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
@@ -572,6 +573,7 @@ def try_git(repo_dir: Path, args: Sequence[str]) -> str | None:
         ["git", *args],
         cwd=repo_dir,
         text=True,
+        env=git_noninteractive_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -584,13 +586,25 @@ def safe_repo_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "__", value.strip())
 
 
+def git_noninteractive_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_ASKPASS", "/bin/false")
+    env.setdefault("SSH_ASKPASS", "/bin/false")
+    return env
+
+
 def clone_or_fetch_repo(seed: PatchSeed, work_dir: Path) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = work_dir / safe_repo_name(seed.html_url or seed.clone_url)
     if repo_dir.exists():
         run_git(repo_dir, ["fetch", "--all", "--tags", "--prune"], capture=False)
         return repo_dir
-    subprocess.run(["git", "clone", "--quiet", seed.clone_url, str(repo_dir)], check=True)
+    subprocess.run(
+        ["git", "clone", "--quiet", seed.clone_url, str(repo_dir)],
+        check=True,
+        env=git_noninteractive_env(),
+    )
     return repo_dir
 
 
