@@ -15,6 +15,8 @@ RECORDS_PER_BATCH="${RECORDS_PER_BATCH:-2000}"
 TARGET_SEEDS="${TARGET_SEEDS:-}"
 NVD_API_KEY="${NVD_API_KEY:-}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-10}"
+NVD_MAX_RETRIES="${NVD_MAX_RETRIES:-3}"
+NVD_RETRY_SLEEP_SECONDS="${NVD_RETRY_SLEEP_SECONDS:-10}"
 
 usage() {
   cat <<'USAGE'
@@ -33,6 +35,8 @@ Options:
   --batch-days N                NVD date window size per request.
   --records-per-batch N         Maximum CVE records per date window.
   --api-key KEY                 Optional NVD API key.
+  --nvd-max-retries N           Maximum retries for NVD rate-limit/server errors.
+  --nvd-retry-sleep-seconds N   Sleep seconds before retrying NVD requests.
   --progress-interval SECONDS   Print progress every N seconds. Use 0 to disable.
   --require-trigger             Keep only seeds with trigger code.
   -h, --help                    Show this help.
@@ -87,6 +91,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --api-key)
       NVD_API_KEY="$2"
+      shift 2
+      ;;
+    --nvd-max-retries)
+      NVD_MAX_RETRIES="$2"
+      shift 2
+      ;;
+    --nvd-retry-sleep-seconds)
+      NVD_RETRY_SLEEP_SECONDS="$2"
       shift 2
       ;;
     --progress-interval)
@@ -169,7 +181,9 @@ harvest_args=(
   --seed-output "$SEED_JSONL" \
   --target-seeds "$TARGET_SEEDS" \
   --batch-days "$BATCH_DAYS" \
-  --records-per-batch "$RECORDS_PER_BATCH"
+  --records-per-batch "$RECORDS_PER_BATCH" \
+  --max-retries "$NVD_MAX_RETRIES" \
+  --retry-sleep-seconds "$NVD_RETRY_SLEEP_SECONDS"
 )
 
 if [[ -n "$NVD_API_KEY" ]]; then

@@ -1,5 +1,6 @@
 import json
 import subprocess
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -284,6 +285,49 @@ def test_fetch_nvd_cves_paginates_api(monkeypatch):
     assert first_query["startIndex"] == ["0"]
 
 
+def test_fetch_nvd_cves_retries_rate_limit(monkeypatch):
+    calls = 0
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "totalResults": 1,
+                    "resultsPerPage": 1,
+                    "vulnerabilities": [{"cve": {"id": "CVE-2099-0099"}}],
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout: int):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+        return FakeResponse()
+
+    monkeypatch.setattr("vuln_patch_harvester.harvester.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("vuln_patch_harvester.harvester.time.sleep", sleeps.append)
+
+    records = fetch_nvd_cves(
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        results_per_page=1,
+        max_records=1,
+        retry_sleep_seconds=1,
+    )
+
+    assert [record["cve"]["id"] for record in records] == ["CVE-2099-0099"]
+    assert calls == 2
+    assert sleeps == [1]
+
+
 def test_write_nvd_cves_outputs_jsonl(tmp_path: Path):
     output_path = tmp_path / "nvd_raw.jsonl"
     records = [{"cve": {"id": "CVE-2099-0009"}}, {"cve": {"id": "CVE-2099-0010"}}]
@@ -300,7 +344,15 @@ def test_write_nvd_cves_outputs_jsonl(tmp_path: Path):
 def test_harvest_nvd_seed_candidates_fetches_until_target(monkeypatch):
     calls: list[tuple[str, str, int | None]] = []
 
-    def fake_fetch_nvd_cves(start_date, end_date, results_per_page=2000, max_records=None, api_key=None):
+    def fake_fetch_nvd_cves(
+        start_date,
+        end_date,
+        results_per_page=2000,
+        max_records=None,
+        api_key=None,
+        max_retries=3,
+        retry_sleep_seconds=10.0,
+    ):
         calls.append((start_date, end_date, max_records))
         if len(calls) == 1:
             return [{"cve": {"id": "CVE-2099-0011", "references": {"referenceData": []}}}]

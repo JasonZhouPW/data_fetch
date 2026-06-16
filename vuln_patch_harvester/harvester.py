@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -96,6 +98,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     nvd_parser.add_argument("--api-key", default=None, help="Optional NVD API key. Defaults to NVD_API_KEY env var.")
     nvd_parser.add_argument("--results-per-page", type=int, default=2000, help="NVD page size, capped at 2000.")
     nvd_parser.add_argument("--max-records", type=int, default=None, help="Maximum CVE records to download.")
+    nvd_parser.add_argument("--max-retries", type=int, default=3, help="Maximum retries for NVD rate-limit/server errors.")
+    nvd_parser.add_argument("--retry-sleep-seconds", type=float, default=10.0, help="Sleep seconds before retrying NVD requests.")
     harvest_parser = subparsers.add_parser(
         "harvest-nvd-seeds",
         help="Download NVD records in date batches until commit seed candidates are found.",
@@ -108,6 +112,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     harvest_parser.add_argument("--batch-days", type=int, default=30, help="NVD query window size in days.")
     harvest_parser.add_argument("--records-per-batch", type=int, default=2000, help="Maximum CVE records per date batch.")
     harvest_parser.add_argument("--api-key", default=None, help="Optional NVD API key. Defaults to NVD_API_KEY env var.")
+    harvest_parser.add_argument("--max-retries", type=int, default=3, help="Maximum retries for NVD rate-limit/server errors.")
+    harvest_parser.add_argument("--retry-sleep-seconds", type=float, default=10.0, help="Sleep seconds before retrying NVD requests.")
     parser.add_argument("--seed-jsonl", help="Input JSONL containing commit URLs and trigger metadata.")
     parser.add_argument("--output-dir", default="final_data_vuln_patch", help="Directory for output JSONL.")
     parser.add_argument("--work-dir", default=".cache/vuln_patch_repos", help="Directory for cloned repositories.")
@@ -161,10 +167,41 @@ def nvd_datetime(value: str) -> str:
     return f"{value}T00:00:00.000Z"
 
 
-def fetch_json(url: str, headers: dict[str, str] | None = None) -> dict:
+def retry_after_seconds(error: urllib.error.HTTPError, fallback: float) -> float:
+    retry_after = error.headers.get("Retry-After") if error.headers else None
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def fetch_json(
+    url: str,
+    headers: dict[str, str] | None = None,
+    max_retries: int = 3,
+    retry_sleep_seconds: float = 10.0,
+) -> dict:
     request = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            if not retryable or attempt >= max_retries:
+                raise
+            sleep_seconds = retry_after_seconds(exc, retry_sleep_seconds)
+            print(
+                f"NVD request got HTTP {exc.code}; retrying in {sleep_seconds:g}s "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+            attempt += 1
 
 
 def fetch_nvd_cves(
@@ -173,6 +210,8 @@ def fetch_nvd_cves(
     results_per_page: int = 2000,
     max_records: int | None = None,
     api_key: str | None = None,
+    max_retries: int = 3,
+    retry_sleep_seconds: float = 10.0,
 ) -> list[dict]:
     records: list[dict] = []
     start_index = 0
@@ -189,7 +228,12 @@ def fetch_nvd_cves(
                 "startIndex": start_index,
             }
         )
-        payload = fetch_json(f"https://services.nvd.nist.gov/rest/json/cves/2.0?{params}", headers=headers)
+        payload = fetch_json(
+            f"https://services.nvd.nist.gov/rest/json/cves/2.0?{params}",
+            headers=headers,
+            max_retries=max_retries,
+            retry_sleep_seconds=retry_sleep_seconds,
+        )
         vulnerabilities = payload.get("vulnerabilities") or []
         if not isinstance(vulnerabilities, list) or not vulnerabilities:
             break
@@ -219,6 +263,8 @@ def harvest_nvd_seed_candidates(
     batch_days: int = 30,
     records_per_batch: int = 2000,
     api_key: str | None = None,
+    max_retries: int = 3,
+    retry_sleep_seconds: float = 10.0,
 ) -> tuple[list[dict], list[dict]]:
     candidates: list[dict] = []
     raw_records: list[dict] = []
@@ -233,6 +279,8 @@ def harvest_nvd_seed_candidates(
             end_date=batch_end.isoformat(),
             max_records=records_per_batch,
             api_key=api_key,
+            max_retries=max_retries,
+            retry_sleep_seconds=retry_sleep_seconds,
         )
         raw_records.extend(batch_records)
         for candidate in build_seed_candidates_from_payloads(batch_records):
@@ -703,6 +751,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             results_per_page=args.results_per_page,
             max_records=args.max_records,
             api_key=args.api_key or os.getenv("NVD_API_KEY"),
+            max_retries=args.max_retries,
+            retry_sleep_seconds=args.retry_sleep_seconds,
         )
         written = write_nvd_cves(records, Path(args.output))
         print(f"Wrote {written} NVD CVE records to {args.output}", flush=True)
@@ -715,6 +765,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_days=args.batch_days,
             records_per_batch=args.records_per_batch,
             api_key=args.api_key or os.getenv("NVD_API_KEY"),
+            max_retries=args.max_retries,
+            retry_sleep_seconds=args.retry_sleep_seconds,
         )
         raw_written = write_nvd_cves(raw_records, Path(args.raw_output))
         seed_written = write_seed_candidates(candidates, Path(args.seed_output))

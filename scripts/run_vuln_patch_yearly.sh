@@ -17,6 +17,8 @@ NVD_API_KEY="${NVD_API_KEY:-}"
 REQUIRE_TRIGGER="${REQUIRE_TRIGGER:-0}"
 RESUME="${RESUME:-1}"
 FORCE="${FORCE:-0}"
+NVD_MAX_RETRIES="${NVD_MAX_RETRIES:-3}"
+NVD_RETRY_SLEEP_SECONDS="${NVD_RETRY_SLEEP_SECONDS:-10}"
 
 usage() {
   cat <<'USAGE'
@@ -33,6 +35,8 @@ Options:
   --work-root DIR               Root directory for temporary repository clones.
   --progress-interval SECONDS   Print progress every N seconds. Use 0 to disable.
   --api-key KEY                 Optional NVD API key.
+  --nvd-max-retries N           Maximum retries for NVD rate-limit/server errors.
+  --nvd-retry-sleep-seconds N   Sleep seconds before retrying NVD requests.
   --require-trigger             Keep only seeds with trigger code.
   --force                       Reprocess years even when .done exists.
   --no-resume                   Ignore .done markers and process every year.
@@ -91,6 +95,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --api-key)
       NVD_API_KEY="$2"
+      shift 2
+      ;;
+    --nvd-max-retries)
+      NVD_MAX_RETRIES="$2"
+      shift 2
+      ;;
+    --nvd-retry-sleep-seconds)
+      NVD_RETRY_SLEEP_SECONDS="$2"
       shift 2
       ;;
     --require-trigger)
@@ -170,6 +182,8 @@ for year in $(seq "$START_YEAR" "$END_YEAR"); do
     --work-dir "$WORK_ROOT/$year"
     --qa-jsonl "$year_dir/vuln_patch_qa_$year.jsonl"
     --progress-interval "$PROGRESS_INTERVAL"
+    --nvd-max-retries "$NVD_MAX_RETRIES"
+    --nvd-retry-sleep-seconds "$NVD_RETRY_SLEEP_SECONDS"
   )
 
   if [[ -n "$NVD_API_KEY" ]]; then
