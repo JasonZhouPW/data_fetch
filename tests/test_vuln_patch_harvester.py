@@ -274,6 +274,7 @@ def test_fetch_nvd_cves_paginates_api(monkeypatch):
         results_per_page=1,
         max_records=2,
         api_key="secret",
+        request_interval_seconds=0,
     )
 
     assert [record["cve"]["id"] for record in records] == ["CVE-2099-0007", "CVE-2099-0008"]
@@ -321,11 +322,44 @@ def test_fetch_nvd_cves_retries_rate_limit(monkeypatch):
         results_per_page=1,
         max_records=1,
         retry_sleep_seconds=1,
+        request_interval_seconds=0,
     )
 
     assert [record["cve"]["id"] for record in records] == ["CVE-2099-0099"]
     assert calls == 2
     assert sleeps == [1]
+
+
+def test_fetch_nvd_cves_throttles_without_api_key(monkeypatch):
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "totalResults": 1,
+                    "resultsPerPage": 1,
+                    "vulnerabilities": [{"cve": {"id": "CVE-2099-0100"}}],
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr("vuln_patch_harvester.harvester.urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    monkeypatch.setattr("vuln_patch_harvester.harvester.time.sleep", sleeps.append)
+
+    fetch_nvd_cves(
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        results_per_page=1,
+        max_records=1,
+    )
+
+    assert sleeps == [7.0]
 
 
 def test_write_nvd_cves_outputs_jsonl(tmp_path: Path):
@@ -352,6 +386,7 @@ def test_harvest_nvd_seed_candidates_fetches_until_target(monkeypatch):
         api_key=None,
         max_retries=3,
         retry_sleep_seconds=10.0,
+        request_interval_seconds=None,
     ):
         calls.append((start_date, end_date, max_records))
         if len(calls) == 1:

@@ -100,6 +100,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     nvd_parser.add_argument("--max-records", type=int, default=None, help="Maximum CVE records to download.")
     nvd_parser.add_argument("--max-retries", type=int, default=3, help="Maximum retries for NVD rate-limit/server errors.")
     nvd_parser.add_argument("--retry-sleep-seconds", type=float, default=10.0, help="Sleep seconds before retrying NVD requests.")
+    nvd_parser.add_argument(
+        "--request-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between NVD requests. Defaults to 7 without an API key, 0.7 with a key.",
+    )
     harvest_parser = subparsers.add_parser(
         "harvest-nvd-seeds",
         help="Download NVD records in date batches until commit seed candidates are found.",
@@ -114,6 +120,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     harvest_parser.add_argument("--api-key", default=None, help="Optional NVD API key. Defaults to NVD_API_KEY env var.")
     harvest_parser.add_argument("--max-retries", type=int, default=3, help="Maximum retries for NVD rate-limit/server errors.")
     harvest_parser.add_argument("--retry-sleep-seconds", type=float, default=10.0, help="Sleep seconds before retrying NVD requests.")
+    harvest_parser.add_argument(
+        "--request-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between NVD requests. Defaults to 7 without an API key, 0.7 with a key.",
+    )
     parser.add_argument("--seed-jsonl", help="Input JSONL containing commit URLs and trigger metadata.")
     parser.add_argument("--output-dir", default="final_data_vuln_patch", help="Directory for output JSONL.")
     parser.add_argument("--work-dir", default=".cache/vuln_patch_repos", help="Directory for cloned repositories.")
@@ -212,6 +224,7 @@ def fetch_nvd_cves(
     api_key: str | None = None,
     max_retries: int = 3,
     retry_sleep_seconds: float = 10.0,
+    request_interval_seconds: float | None = None,
 ) -> list[dict]:
     records: list[dict] = []
     start_index = 0
@@ -219,6 +232,8 @@ def fetch_nvd_cves(
     headers = {"User-Agent": "vuln-patch-harvester"}
     if api_key:
         headers["apiKey"] = api_key
+    if request_interval_seconds is None:
+        request_interval_seconds = 0.7 if api_key else 7.0
     while True:
         params = urllib.parse.urlencode(
             {
@@ -228,6 +243,14 @@ def fetch_nvd_cves(
                 "startIndex": start_index,
             }
         )
+        if request_interval_seconds > 0:
+            print(
+                f"Waiting {request_interval_seconds:g}s before NVD request "
+                f"({start_date} to {end_date}, startIndex={start_index})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(request_interval_seconds)
         payload = fetch_json(
             f"https://services.nvd.nist.gov/rest/json/cves/2.0?{params}",
             headers=headers,
@@ -265,6 +288,7 @@ def harvest_nvd_seed_candidates(
     api_key: str | None = None,
     max_retries: int = 3,
     retry_sleep_seconds: float = 10.0,
+    request_interval_seconds: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
     candidates: list[dict] = []
     raw_records: list[dict] = []
@@ -281,6 +305,7 @@ def harvest_nvd_seed_candidates(
             api_key=api_key,
             max_retries=max_retries,
             retry_sleep_seconds=retry_sleep_seconds,
+            request_interval_seconds=request_interval_seconds,
         )
         raw_records.extend(batch_records)
         for candidate in build_seed_candidates_from_payloads(batch_records):
@@ -753,6 +778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_key=args.api_key or os.getenv("NVD_API_KEY"),
             max_retries=args.max_retries,
             retry_sleep_seconds=args.retry_sleep_seconds,
+            request_interval_seconds=args.request_interval_seconds,
         )
         written = write_nvd_cves(records, Path(args.output))
         print(f"Wrote {written} NVD CVE records to {args.output}", flush=True)
@@ -767,6 +793,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_key=args.api_key or os.getenv("NVD_API_KEY"),
             max_retries=args.max_retries,
             retry_sleep_seconds=args.retry_sleep_seconds,
+            request_interval_seconds=args.request_interval_seconds,
         )
         raw_written = write_nvd_cves(raw_records, Path(args.raw_output))
         seed_written = write_seed_candidates(candidates, Path(args.seed_output))

@@ -17,6 +17,7 @@ NVD_API_KEY="${NVD_API_KEY:-}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-10}"
 NVD_MAX_RETRIES="${NVD_MAX_RETRIES:-3}"
 NVD_RETRY_SLEEP_SECONDS="${NVD_RETRY_SLEEP_SECONDS:-10}"
+NVD_REQUEST_INTERVAL_SECONDS="${NVD_REQUEST_INTERVAL_SECONDS:-}"
 
 usage() {
   cat <<'USAGE'
@@ -37,6 +38,9 @@ Options:
   --api-key KEY                 Optional NVD API key.
   --nvd-max-retries N           Maximum retries for NVD rate-limit/server errors.
   --nvd-retry-sleep-seconds N   Sleep seconds before retrying NVD requests.
+  --nvd-request-interval-seconds N
+                                Minimum seconds between NVD requests.
+                                Defaults to 7 without an API key, 0.7 with a key.
   --progress-interval SECONDS   Print progress every N seconds. Use 0 to disable.
   --require-trigger             Keep only seeds with trigger code.
   -h, --help                    Show this help.
@@ -99,6 +103,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --nvd-retry-sleep-seconds)
       NVD_RETRY_SLEEP_SECONDS="$2"
+      shift 2
+      ;;
+    --nvd-request-interval-seconds)
+      NVD_REQUEST_INTERVAL_SECONDS="$2"
       shift 2
       ;;
     --progress-interval)
@@ -188,6 +196,9 @@ harvest_args=(
 
 if [[ -n "$NVD_API_KEY" ]]; then
   harvest_args+=(--api-key "$NVD_API_KEY")
+fi
+if [[ -n "$NVD_REQUEST_INTERVAL_SECONDS" ]]; then
+  harvest_args+=(--request-interval-seconds "$NVD_REQUEST_INTERVAL_SECONDS")
 fi
 
 run_with_progress "harvest-nvd-seeds" python3 -m vuln_patch_harvester "${harvest_args[@]}"
