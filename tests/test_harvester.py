@@ -34,6 +34,8 @@ from github_code_harvester.harvester import (
     load_failed_repos_from_csv,
     read_failed_repo_names,
     merge_commit_jsons_to_jsonl,
+    normalize_stackoverflow_jsonl,
+    normalize_stackoverflow_jsonl_path,
     mark_repo_finished,
     process_repo,
     process_repo_to_commit_jsons,
@@ -45,14 +47,19 @@ from github_code_harvester.harvester import (
     select_eligible_repos,
     append_repo_csv,
     filter_unfinished_repos,
+    discover_public_article_urls_from_search_urls,
     extract_public_article_urls,
+    fetch_zhihu_api_records,
     write_repo_csv,
     write_jsonl_for_commit,
     parse_stackoverflow_args,
     parse_stackoverflow_dump_args,
     parse_stackoverflow_dump_from_shards_args,
     parse_stackoverflow_dump_shard_args,
+    parse_zhihu_api_args,
     public_article_to_record,
+    resolve_zhihu_access_secret,
+    resolve_zhihu_access_secrets,
     read_stackoverflow_dump_checkpoint,
     repo_has_commit_since_via_api,
     process_stackoverflow_dump_shards,
@@ -68,6 +75,8 @@ from github_code_harvester.harvester import (
     write_stackoverflow_dump_batches,
     write_stackoverflow_dump_jsonl,
     write_stackoverflow_records,
+    zhihu_api_get_json,
+    zhihu_api_item_to_record,
 )
 
 
@@ -993,6 +1002,27 @@ def test_anonymize_record_preserves_source_url_but_masks_text_and_author():
     assert anonymized["meta"]["data_info"]["author"] == "xxxxxxxxxxxxxxxxx"
 
 
+def test_anonymize_record_preserves_dataset_ids_for_deduplication():
+    record = {
+        "id": "zhihu_api_1903044959663284716",
+        "text": "contact 13800138000",
+        "meta": {
+            "data_info": {
+                "content_id": "1903044959663284716",
+                "query": "golang编程",
+                "voteup_count": 43,
+            }
+        },
+    }
+
+    anonymized = anonymize_record(record)
+
+    assert anonymized["id"] == "zhihu_api_1903044959663284716"
+    assert anonymized["meta"]["data_info"]["content_id"] == "1903044959663284716"
+    assert anonymized["meta"]["data_info"]["query"] == "golang编程"
+    assert "13800138000" not in anonymized["text"]
+
+
 def test_build_record_uses_commit_hash_id_and_required_metadata():
     repo = RepoInfo(
         full_name="owner/webapp",
@@ -1124,19 +1154,15 @@ def test_stackoverflow_question_to_record_combines_question_and_answers():
     assert "Accepted answer" in record["text"]
     assert "Validate the input first" not in record["text"]
     assert record["meta"]["data_info"] == {
+        "lang": "Python",
         "source": "StackOverflow",
-        "type": "技术问答",
         "url": "https://stackoverflow.com/questions/123/how-do-i-parse-json-safely",
-        "license": "CC BY-SA 4.0",
-        "site": "stackoverflow",
-        "tag": "python",
-        "tags": ["python", "json"],
-        "score": 42,
-        "views": 9000,
-        "answer_count": 2,
+        "type": "技术问答",
         "author": "Question Author",
         "public_date": "2024-01-01T00:00:00+00:00",
+        "project_type": "General Programming",
     }
+    assert set(record["meta"]) == {"data_info"}
 
 
 def test_write_stackoverflow_records_outputs_jsonl(tmp_path: Path):
@@ -1231,19 +1257,86 @@ def test_stackoverflow_dump_question_to_record_matches_api_shape():
     assert "Title: How do I parse JSON safely?" in record["text"]
     assert "Answer 1" in record["text"]
     assert record["meta"]["data_info"] == {
+        "lang": "Python",
         "source": "StackOverflow",
-        "type": "技术问答",
         "url": "https://stackoverflow.com/questions/123",
-        "license": "CC BY-SA 4.0",
-        "site": "stackoverflow",
-        "tag": "python",
-        "tags": ["python", "json"],
-        "score": 42,
-        "views": 9000,
-        "answer_count": 2,
+        "type": "技术问答",
         "author": "Question Author",
         "public_date": "2024-01-01T00:00:00+00:00",
+        "project_type": "General Programming",
     }
+    assert set(record["meta"]) == {"data_info"}
+
+
+def test_normalize_stackoverflow_jsonl_replaces_tag_with_lang_and_project_type(tmp_path: Path):
+    input_path = tmp_path / "old.jsonl"
+    output_path = tmp_path / "new.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "id": "stackoverflow_question_1",
+                "text": "question\n",
+                "meta": {
+                    "data_info": {
+                        "source": "StackOverflow",
+                        "tag": "java",
+                        "tags": ["java", "sql", "oracle-database"],
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert normalize_stackoverflow_jsonl(input_path, output_path) == 1
+
+    row = json.loads(output_path.read_text(encoding="utf-8"))
+    data_info = row["meta"]["data_info"]
+    assert "tag" not in data_info
+    assert data_info["lang"] == "Java"
+    assert data_info["project_type"] == "Database"
+    assert data_info == {
+        "lang": "Java",
+        "source": "StackOverflow",
+        "url": "",
+        "type": "技术问答",
+        "author": "unknown",
+        "public_date": "",
+        "project_type": "Database",
+    }
+    assert set(row["meta"]) == {"data_info"}
+
+
+def test_normalize_stackoverflow_jsonl_path_converts_directory(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    nested_dir = input_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    rows = [
+        {
+            "id": "stackoverflow_question_1",
+            "text": "question\n",
+            "meta": {"data_info": {"source": "StackOverflow", "tag": "python", "tags": ["python", "pandas"]}},
+        },
+        {
+            "id": "stackoverflow_question_2",
+            "text": "question\n",
+            "meta": {"data_info": {"source": "StackOverflow", "tag": "javascript", "tags": ["javascript", "reactjs"]}},
+        },
+    ]
+    (input_dir / "a.jsonl").write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+    (nested_dir / "b.jsonl").write_text(json.dumps(rows[1]) + "\n", encoding="utf-8")
+
+    files_written, records_written = normalize_stackoverflow_jsonl_path(input_dir, output_dir)
+
+    assert (files_written, records_written) == (2, 2)
+    first = json.loads((output_dir / "a.jsonl").read_text(encoding="utf-8"))
+    second = json.loads((output_dir / "nested" / "b.jsonl").read_text(encoding="utf-8"))
+    assert first["meta"]["data_info"]["project_type"] == "Data Science & Machine Learning"
+    assert second["meta"]["data_info"]["project_type"] == "Web Frontend"
+    assert set(first["meta"]) == {"data_info"}
+    assert set(second["meta"]) == {"data_info"}
 
 
 def test_write_stackoverflow_dump_jsonl_streams_posts_xml(tmp_path: Path):
@@ -1780,6 +1873,37 @@ def test_public_article_to_record_cleans_code_related_article():
     assert "def fetch" in record["text"]
 
 
+def test_discover_public_article_urls_from_search_urls_extracts_zhihu_links(monkeypatch):
+    search_html = """
+    <html>
+      <body>
+        <a href="/question/123456/answer/789">Golang 编程技巧回答</a>
+        <a href="https://zhuanlan.zhihu.com/p/456789">Golang 经验专栏</a>
+        <a href="https://www.zhihu.com/search?q=golang&type=content">Nested search</a>
+      </body>
+    </html>
+    """
+
+    def fake_get_text(url: str) -> str:
+        assert "zhihu.com/search" in url
+        return search_html
+
+    monkeypatch.setattr(harvester, "public_article_get_text", fake_get_text)
+
+    urls = discover_public_article_urls_from_search_urls(
+        source="zhihu",
+        search_urls=[
+            "https://www.zhihu.com/search?q=golang%E7%BC%96%E7%A8%8B%E6%8A%80%E5%B7%A7%E5%92%8C%E7%BB%8F%E9%AA%8C&type=content"
+        ],
+        sleep_seconds=0,
+    )
+
+    assert urls == [
+        "https://www.zhihu.com/question/123456/answer/789",
+        "https://zhuanlan.zhihu.com/p/456789",
+    ]
+
+
 def test_collect_public_article_records_skips_wrong_source_and_short_pages(monkeypatch):
     good_html = "<title>Go error</title><article>" + ("Go 代码 error return func() " * 40) + "</article>"
     short_html = "<title>Too short</title><article>hello</article>"
@@ -1805,6 +1929,205 @@ def test_collect_public_article_records_skips_wrong_source_and_short_pages(monke
 
     assert [record["meta"]["data_info"]["url"] for record in records] == [
         "https://zhuanlan.zhihu.com/p/good"
+    ]
+
+
+def test_parse_zhihu_api_args_sets_official_api_defaults():
+    args = parse_zhihu_api_args([])
+
+    assert args.output_dir == "final_data_zhihu_api"
+    assert args.queries == ["python", "java", "javascript", "go", "c++", "代码"]
+    assert args.count == 10
+    assert args.max_records == 1000
+
+
+def test_zhihu_api_get_json_sends_bearer_and_timestamp(monkeypatch):
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"Code": 0, "Data": {"Items": []}}).encode("utf-8")
+
+    def fake_urlopen(request, timeout: int):
+        seen["url"] = request.full_url
+        seen["authorization"] = request.headers.get("Authorization")
+        seen["timestamp"] = request.headers.get("X-request-timestamp")
+        return FakeResponse()
+
+    monkeypatch.setattr(harvester.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(harvester.time, "time", lambda: 1_762_000_000)
+
+    payload = zhihu_api_get_json(
+        api_url="https://developer.zhihu.com/api/v1/content/zhihu_search",
+        query="golang 编程",
+        count=99,
+        access_secret="secret",
+    )
+
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(str(seen["url"])).query)
+    assert payload["Code"] == 0
+    assert query["Query"] == ["golang 编程"]
+    assert query["Count"] == ["10"]
+    assert seen["authorization"] == "Bearer secret"
+    assert seen["timestamp"] == "1762000000"
+
+
+def test_fetch_zhihu_api_records_converts_items_and_deduplicates(monkeypatch):
+    def fake_get_json(api_url: str, query: str, count: int, access_secret: str) -> dict:
+        return {
+            "Code": 0,
+            "Data": {
+                "Items": [
+                    {
+                        "Title": "Go 并发编程技巧",
+                        "ContentType": "Article",
+                        "ContentID": "123",
+                        "ContentText": "这篇文章介绍 goroutine channel error 处理和 Go 代码实践。" * 4,
+                        "Url": "https://zhuanlan.zhihu.com/p/123",
+                        "CommentCount": 3,
+                        "VoteUpCount": 10,
+                        "AuthorName": "Alice",
+                        "EditTime": 1_704_067_200,
+                        "CommentInfoList": [{"Content": "补充一个 context 取消技巧"}],
+                        "AuthorityLevel": "2",
+                        "RankingScore": 0.98,
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(harvester, "zhihu_api_get_json", fake_get_json)
+
+    records = fetch_zhihu_api_records(
+        queries=["go", "golang"],
+        access_secrets=["secret"],
+        api_url="https://developer.zhihu.com/api/v1/content/zhihu_search",
+        count=10,
+        max_records=10,
+        min_chars=30,
+        sleep_seconds=0,
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["id"] == "zhihu_api_123"
+    assert "Go 并发编程技巧" in record["text"]
+    assert "精选评论" in record["text"]
+    assert record["meta"]["data_info"]["source"] == "Zhihu"
+    assert record["meta"]["data_info"]["query"] == "go"
+    assert record["meta"]["data_info"]["content_type"] == "Article"
+    assert record["meta"]["data_info"]["voteup_count"] == 10
+
+
+def test_fetch_zhihu_api_records_rotates_multiple_accounts(monkeypatch):
+    used_tokens: list[str] = []
+
+    def fake_get_json(api_url: str, query: str, count: int, access_secret: str) -> dict:
+        used_tokens.append(access_secret)
+        return {
+            "Code": 0,
+            "Data": {
+                "Items": [
+                    {
+                        "Title": f"{query} Python 编程",
+                        "ContentType": "Answer",
+                        "ContentID": query,
+                        "ContentText": "Python 代码 函数 class error debug " * 5,
+                        "Url": f"https://www.zhihu.com/answer/{query}",
+                        "CommentCount": 0,
+                        "VoteUpCount": 1,
+                        "AuthorName": "Author",
+                        "EditTime": 1_704_067_200,
+                        "AuthorityLevel": "1",
+                        "RankingScore": 0.5,
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(harvester, "zhihu_api_get_json", fake_get_json)
+
+    records = fetch_zhihu_api_records(
+        queries=["q1", "q2", "q3"],
+        access_secrets=["token-a", "token-b"],
+        api_url="https://developer.zhihu.com/api/v1/content/zhihu_search",
+        count=10,
+        max_records=10,
+        min_chars=20,
+        sleep_seconds=0,
+        daily_quota_per_account=2,
+    )
+
+    assert [record["id"] for record in records] == ["zhihu_api_q1", "zhihu_api_q2", "zhihu_api_q3"]
+    assert used_tokens == ["token-a", "token-b", "token-a"]
+
+
+def test_fetch_zhihu_api_records_stops_when_account_quotas_are_spent(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get_json(api_url: str, query: str, count: int, access_secret: str) -> dict:
+        calls.append(query)
+        return {"Code": 0, "Data": {"Items": []}}
+
+    monkeypatch.setattr(harvester, "zhihu_api_get_json", fake_get_json)
+
+    records = fetch_zhihu_api_records(
+        queries=["q1", "q2", "q3"],
+        access_secrets=["token-a"],
+        api_url="https://developer.zhihu.com/api/v1/content/zhihu_search",
+        count=10,
+        max_records=10,
+        min_chars=20,
+        sleep_seconds=0,
+        daily_quota_per_account=2,
+    )
+
+    assert records == []
+    assert calls == ["q1", "q2"]
+
+
+def test_resolve_zhihu_access_secret_prefers_zhihu_token_json_key(tmp_path: Path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    token_path.write_text(
+        json.dumps({"zhihu": "zhihu-token", "zhihu_access_secret": "legacy-token"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZHIHU_ACCESS_SECRET", "env-token")
+
+    assert resolve_zhihu_access_secret(None, token_path) == "zhihu-token"
+    assert resolve_zhihu_access_secret("cli-token", token_path) == "cli-token"
+
+
+def test_resolve_zhihu_access_secrets_supports_multiple_token_sources(tmp_path: Path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    token_path.write_text(
+        json.dumps(
+            {
+                "zhihu": ["token-json-a", "token-json-b"],
+                "zhihu_accounts": ["token-account"],
+                "zhihu_access_secret": "legacy-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZHIHU_ACCESS_SECRET", "env-a,env-b")
+
+    assert resolve_zhihu_access_secrets(["cli-token", "token-json-a"], token_path) == [
+        "cli-token",
+        "token-json-a",
+        "token-json-b",
+        "token-account",
+        "legacy-token",
+        "env-a",
+        "env-b",
     ]
 
 

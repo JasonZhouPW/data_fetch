@@ -453,6 +453,114 @@ REQUIRE_TRIGGER=1 ./scripts/run_vuln_patch_sample.sh
 
 CSDN/知乎入口只处理公开可访问页面，带限速、域名和 URL 形态过滤；遇到登录墙、反爬限制、短正文或非代码内容会跳过。脚本不会绕过登录、验证码、付费墙或站点访问控制。批量使用前请确认你有相应授权，并遵守站点 robots、服务条款和内容版权要求。
 
+如果有知乎开放平台 Access Secret，优先使用官方 `zhihu_search` API：
+
+```bash
+export ZHIHU_ACCESS_SECRET="your_access_secret"
+./scripts/run_zhihu_api_harvest.sh
+```
+
+等价模块命令：
+
+```bash
+PYTHONPATH=. python -m discussion_harvester zhihu-api \
+  --output-dir final_data_zhihu_api \
+  --queries python java golang go c++ javascript 代码 编程 算法 后端 前端 数据库 linux docker kubernetes react vue spring bug 报错 性能优化 \
+  --count 10 \
+  --max-records 1000 \
+  --sleep-seconds 1.0
+```
+
+也可以在 `token.json` 中配置：
+
+```json
+{
+  "zhihu": "your_access_secret"
+}
+```
+
+多个账号可配置为数组，脚本会轮换调用，每个账号本次最多使用 5000 次：
+
+```json
+{
+  "zhihu": [
+    "access_secret_account_1",
+    "access_secret_account_2"
+  ]
+}
+```
+
+也兼容 `zhihu_accounts` 和旧键名：
+
+```json
+{
+  "zhihu_accounts": [
+    "access_secret_account_1",
+    "access_secret_account_2"
+  ],
+  "zhihu_access_secret": "your_access_secret"
+}
+```
+
+知乎官方 API 输出：
+
+```text
+final_data_zhihu_api/zhihu_api_articles.jsonl
+```
+
+`zhihu-api` 参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--output-dir` | `final_data_zhihu_api` | JSONL 输出目录。 |
+| `--queries` | `python java javascript go c++ 代码` | 搜索关键词，空格分隔。 |
+| `--count` | `10` | 每个关键词请求数量；知乎接口最大为 10。 |
+| `--max-records` | `1000` | 本次最多写入去重后的记录数。 |
+| `--min-chars` | `100` | 清洗后正文最少字符数。 |
+| `--access-secret` | `token.json` 的 `zhihu` / `zhihu_accounts` / `zhihu_access_secret` 字段，或环境变量 `ZHIHU_ACCESS_SECRET` | 知乎开放平台 Access Secret；可重复传入多个账号，命令行参数优先级最高。 |
+| `--daily-quota-per-account` | `5000` | 每个账号本次最多消耗的 API 调用次数，用于匹配知乎账号日调用上限。 |
+| `--sleep-seconds` | `1.0` | API 请求之间的等待时间。 |
+
+输出每条记录会保留 `query`、`content_type`、`content_id`、`url`、`author`、`public_date`、`comment_count`、`voteup_count`、`authority_level` 和 `ranking_score`。
+
+CSDN/知乎一键式采集示例，不需要提前准备 URL 文件：
+
+```bash
+PYTHON_BIN=python3.11 ./scripts/run_public_article_harvest.sh
+```
+
+该脚本默认会同时跑 `csdn` 和 `zhihu`，关键词为 `python java javascript go c++ 代码 编程 算法 bug 报错 数据库 linux docker react vue spring`，输出：
+
+```text
+final_data_csdn/csdn_articles.jsonl
+final_data_zhihu/zhihu_articles.jsonl
+```
+
+只跑 CSDN 或知乎：
+
+```bash
+PYTHON_BIN=python3.11 ./scripts/run_public_article_harvest.sh --source csdn --max-records 5000
+PYTHON_BIN=python3.11 ./scripts/run_public_article_harvest.sh --source zhihu --max-records 5000
+```
+
+覆盖关键词：
+
+```bash
+PYTHON_BIN=python3.11 ./scripts/run_public_article_harvest.sh \
+  --source all \
+  --queries "python java go 代码 编程 算法 报错"
+```
+
+也可以直接传公开搜索结果页 URL，让脚本从该页面发现回答/专栏链接：
+
+```bash
+PYTHON_BIN=python3.11 ./scripts/run_public_article_harvest.sh \
+  --source zhihu \
+  --search-url "https://www.zhihu.com/search?q=golang%E7%BC%96%E7%A8%8B%E6%8A%80%E5%B7%A7%E5%92%8C%E7%BB%8F%E9%AA%8C&search_source=Suggestion&utm_content=search_suggestion&type=content" \
+  --queries \
+  --max-records 1000
+```
+
 Stack Overflow 完整启动命令示例：
 
 ```bash
@@ -509,7 +617,7 @@ final_data_stackoverflow/stackoverflow_python.jsonl
 每行格式：
 
 ```json
-{"id":"stackoverflow_question_123","text":"Title + Question + Accepted/high-score answers","meta":{"data_info":{"source":"StackOverflow","type":"技术问答","url":"https://stackoverflow.com/questions/123/...","license":"CC BY-SA 4.0","site":"stackoverflow","tag":"python","tags":["python","json"],"score":42,"views":9000,"answer_count":2,"author":"Question Author","public_date":"2024-01-01T00:00:00+00:00"}}}
+{"id":"stackoverflow_question_123","text":"Title + Question + Accepted/high-score answers","meta":{"data_info":{"lang":"Python","source":"StackOverflow","url":"https://stackoverflow.com/questions/123/...","type":"技术问答","author":"Question Author","public_date":"2024-01-01T00:00:00+00:00","project_type":"General Programming"}}}
 ```
 
 采集策略：
@@ -519,6 +627,14 @@ final_data_stackoverflow/stackoverflow_python.jsonl
 - 每个问题合并 title、question body，以及 accepted answer 或高赞 answers。
 - 不同 tag 命中的同一个 question 只写入一次，保留第一次命中的 tag。
 - Stack Overflow 内容许可证为 CC BY-SA，输出中保留 `url`、`author`、`license` 和 `public_date`，后续使用时仍需遵守 attribution 和 share-alike 要求。
+
+如果已经生成了旧格式 Stack Overflow JSONL，可以转换为 `lang` / `project_type` 新格式：
+
+```bash
+python3 -m discussion_harvester normalize-stackoverflow-jsonl \
+  --input stackoverflow_dump_shard_030_000059.jsonl \
+  --output stackoverflow_dump_shard_030_000059.normalized.jsonl
+```
 
 ### Stack Overflow Dump
 

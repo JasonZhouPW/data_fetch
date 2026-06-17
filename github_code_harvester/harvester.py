@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -41,6 +42,7 @@ GITEE_MAX_SEARCH_PAGES = 100
 GITEE_DEFAULT_SEED_ORGS = ("dromara", "openeuler", "mindspore", "openharmony", "openkylin")
 TOKEN_CONFIG_PATH = "token.json"
 STACKEXCHANGE_API_BASE_URL = "https://api.stackexchange.com/2.3"
+ZHIHU_SEARCH_API_URL = "https://developer.zhihu.com/api/v1/content/zhihu_search"
 DISCUSSION_TAGS = ("python", "java", "javascript", "go", "c++")
 ARTICLE_QUERIES = ("python", "java", "javascript", "go", "c++", "代码")
 ARTICLE_SEARCH_URLS = {
@@ -82,14 +84,28 @@ CODE_DISCUSSION_TERMS = {
     "算法",
 }
 ANONYMIZE_SKIP_KEYS = {
+    "answer_count",
+    "authority_level",
     "clone_url",
+    "comment_count",
+    "content_id",
+    "content_type",
     "html_url",
+    "id",
+    "lang",
     "license",
+    "project_type",
     "public_date",
+    "query",
+    "ranking_score",
     "site",
     "source",
     "source_url",
+    "tag",
+    "tags",
     "url",
+    "views",
+    "voteup_count",
 }
 DIRECT_PII_PATTERNS = (
     re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])"),
@@ -364,6 +380,15 @@ def parse_stackoverflow_dump_from_shards_args(argv: Sequence[str] | None = None)
     return parser.parse_args(argv)
 
 
+def parse_normalize_stackoverflow_jsonl_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Normalize existing Stack Overflow JSONL metadata to lang/project_type format."
+    )
+    parser.add_argument("--input", required=True, help="Input Stack Overflow JSONL file or directory.")
+    parser.add_argument("--output", required=True, help="Output normalized JSONL file or directory.")
+    return parser.parse_args(argv)
+
+
 def parse_public_article_args(source: str, argv: Sequence[str] | None = None) -> argparse.Namespace:
     source_label = CSDN_SOURCE_NAME if source == "csdn" else ZHIHU_SOURCE_NAME
     parser = argparse.ArgumentParser(
@@ -373,6 +398,7 @@ def parse_public_article_args(source: str, argv: Sequence[str] | None = None) ->
     parser.add_argument("--queries", nargs="*", default=list(ARTICLE_QUERIES), help="Search keywords to collect.")
     parser.add_argument("--url", action="append", default=[], help="Explicit public article/answer URL. Can be repeated.")
     parser.add_argument("--url-file", default=None, help="Text file with one public URL per line.")
+    parser.add_argument("--search-url", action="append", default=[], help="Explicit public search/result page URL to discover article URLs. Can be repeated.")
     parser.add_argument("--max-pages", type=int, default=3, help="Search result pages to scan per query.")
     parser.add_argument("--max-records", type=int, default=1000, help="Maximum records to write.")
     parser.add_argument("--min-chars", type=int, default=300, help="Minimum cleaned text characters per record.")
@@ -380,17 +406,41 @@ def parse_public_article_args(source: str, argv: Sequence[str] | None = None) ->
     return parser.parse_args(argv)
 
 
-def load_token_config(token_path: Path = Path(TOKEN_CONFIG_PATH)) -> dict[str, str]:
+def parse_zhihu_api_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fetch Zhihu in-site search results through the official Zhihu Open Platform API as JSONL."
+    )
+    parser.add_argument("--output-dir", default="final_data_zhihu_api", help="Directory for Zhihu API JSONL files.")
+    parser.add_argument("--queries", nargs="+", default=list(ARTICLE_QUERIES), help="Search keywords to collect.")
+    parser.add_argument("--count", type=int, default=10, help="Results per query. Zhihu caps this at 10.")
+    parser.add_argument("--max-records", type=int, default=1000, help="Maximum unique records to write.")
+    parser.add_argument("--min-chars", type=int, default=100, help="Minimum cleaned text characters per record.")
+    parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Sleep between API requests.")
+    parser.add_argument("--access-secret", action="append", default=[], help="Zhihu Open Platform Access Secret. Can be repeated. Overrides token.json order.")
+    parser.add_argument("--daily-quota-per-account", type=int, default=5000, help="Maximum API calls to spend per account in this run. Zhihu currently limits each account to 5000/day.")
+    parser.add_argument("--api-url", default=ZHIHU_SEARCH_API_URL, help="Zhihu search API URL.")
+    return parser.parse_args(argv)
+
+
+def load_token_config(token_path: Path = Path(TOKEN_CONFIG_PATH)) -> dict[str, object]:
     if not token_path.exists():
         return {}
     data = json.loads(token_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         return {}
-    return {
-        str(key): str(value).strip()
-        for key, value in data.items()
-        if value is not None and str(value).strip()
-    }
+    cleaned: dict[str, object] = {}
+    for key, value in data.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            tokens = [str(item).strip() for item in value if str(item).strip()]
+            if tokens:
+                cleaned[str(key)] = tokens
+            continue
+        token = str(value).strip()
+        if token:
+            cleaned[str(key)] = token
+    return cleaned
 
 
 def resolve_token(
@@ -402,9 +452,51 @@ def resolve_token(
     if explicit_token:
         return explicit_token
     config_token = load_token_config(token_path).get(provider)
-    if config_token:
+    if isinstance(config_token, str) and config_token:
         return config_token
     return os.getenv(env_name)
+
+
+def coerce_token_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    token = str(value).strip()
+    return [token] if token else []
+
+
+def resolve_zhihu_access_secrets(
+    explicit_tokens: Sequence[str] | None,
+    token_path: Path = Path(TOKEN_CONFIG_PATH),
+) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def add_many(values: Sequence[str]) -> None:
+        for value in values:
+            token = value.strip()
+            if token and token not in seen:
+                tokens.append(token)
+                seen.add(token)
+
+    add_many(list(explicit_tokens or []))
+    config = load_token_config(token_path)
+    add_many(coerce_token_list(config.get("zhihu")))
+    add_many(coerce_token_list(config.get("zhihu_accounts")))
+    add_many(coerce_token_list(config.get("zhihu_access_secret")))
+    env_token = os.getenv("ZHIHU_ACCESS_SECRET")
+    if env_token:
+        add_many(re.split(r"[,;\s]+", env_token))
+    return tokens
+
+
+def resolve_zhihu_access_secret(
+    explicit_token: str | None,
+    token_path: Path = Path(TOKEN_CONFIG_PATH),
+) -> str | None:
+    tokens = resolve_zhihu_access_secrets([explicit_token] if explicit_token else [], token_path)
+    return tokens[0] if tokens else None
 
 
 def is_eligible_repo(repo: RepoInfo) -> bool:
@@ -959,6 +1051,56 @@ def unix_timestamp_to_iso(timestamp: int | float | None) -> str:
     return dt.datetime.fromtimestamp(timestamp, tz=dt.UTC).isoformat()
 
 
+def clean_api_text(value: str | None) -> str:
+    return html_to_text(value or "")
+
+
+def zhihu_api_item_to_record(item: dict, query: str, min_chars: int = 100) -> dict | None:
+    content_id = str(item.get("ContentID") or "").strip()
+    url = str(item.get("Url") or "").strip()
+    title = clean_api_text(str(item.get("Title") or ""))
+    content_text = clean_api_text(str(item.get("ContentText") or ""))
+    comment_infos = item.get("CommentInfoList") or []
+    comments: list[str] = []
+    if isinstance(comment_infos, list):
+        for comment in comment_infos:
+            if isinstance(comment, dict) and comment.get("Content"):
+                comments.append(clean_api_text(str(comment["Content"])))
+    text_parts = [
+        f"Title: {title}",
+        "",
+        content_text,
+    ]
+    if comments:
+        text_parts.extend(["", "精选评论:"])
+        text_parts.extend(f"- {comment}" for comment in comments if comment)
+    text = normalize_discussion_text("\n".join(text_parts))
+    if len(text) < min_chars or not is_code_related_text(text):
+        return None
+    edit_time = item.get("EditTime")
+    public_date = unix_timestamp_to_iso(edit_time) if isinstance(edit_time, (int, float)) else ""
+    return anonymize_record({
+        "id": f"zhihu_api_{safe_repo_name(content_id or url or title)}",
+        "text": text + "\n",
+        "meta": {
+            "data_info": {
+                "source": ZHIHU_SOURCE_NAME,
+                "type": "技术文章",
+                "query": query,
+                "content_type": str(item.get("ContentType") or ""),
+                "content_id": content_id,
+                "url": url,
+                "author": str(item.get("AuthorName") or "unknown"),
+                "public_date": public_date,
+                "comment_count": int(item.get("CommentCount") or 0),
+                "voteup_count": int(item.get("VoteUpCount") or 0),
+                "authority_level": str(item.get("AuthorityLevel") or ""),
+                "ranking_score": float(item.get("RankingScore") or 0),
+            }
+        },
+    })
+
+
 def stackoverflow_question_to_record(
     question: dict,
     tag: str,
@@ -984,26 +1126,23 @@ def stackoverflow_question_to_record(
                 f"{label} (score: {int(answer.get('score') or 0)}):",
                 html_to_text(answer.get("body")),
             ]
-        )
+    )
     owner = question.get("owner") or {}
+    tags = list(question.get("tags") or [])
+    data_info = {
+        "lang": stackoverflow_tag_to_lang(tag),
+        "source": STACKOVERFLOW_SOURCE_NAME,
+        "url": question.get("link") or f"https://stackoverflow.com/questions/{question_id}",
+        "type": "技术问答",
+        "author": owner.get("display_name") or "unknown",
+        "public_date": unix_timestamp_to_iso(question.get("creation_date")),
+        "project_type": infer_stackoverflow_project_type(tags),
+    }
     return anonymize_record({
         "id": f"stackoverflow_question_{question_id}",
         "text": "\n".join(part for part in text_parts if part is not None).strip() + "\n",
         "meta": {
-            "data_info": {
-                "source": STACKOVERFLOW_SOURCE_NAME,
-                "type": "技术问答",
-                "url": question.get("link") or f"https://stackoverflow.com/questions/{question_id}",
-                "license": "CC BY-SA 4.0",
-                "site": site,
-                "tag": tag,
-                "tags": list(question.get("tags") or []),
-                "score": int(question.get("score") or 0),
-                "views": int(question.get("view_count") or 0),
-                "answer_count": int(question.get("answer_count") or 0),
-                "author": owner.get("display_name") or "unknown",
-                "public_date": unix_timestamp_to_iso(question.get("creation_date")),
-            }
+            "data_info": data_info,
         },
     })
 
@@ -1016,8 +1155,170 @@ def write_stackoverflow_records(records: Sequence[dict], output_path: Path) -> i
     return len(records)
 
 
+def normalize_stackoverflow_record(record: dict) -> dict:
+    meta = record.setdefault("meta", {})
+    data_info = meta.setdefault("data_info", {})
+    if data_info.get("source") != STACKOVERFLOW_SOURCE_NAME:
+        return record
+    tag = data_info.pop("tag", "")
+    tags = data_info.get("tags") if isinstance(data_info.get("tags"), list) else []
+    for key in ("license", "site", "tags", "score", "views", "answer_count"):
+        if key in data_info:
+            data_info.pop(key)
+    if not data_info.get("lang"):
+        data_info["lang"] = stackoverflow_tag_to_lang(str(tag or (tags[0] if tags else "")))
+    if not data_info.get("project_type"):
+        data_info["project_type"] = infer_stackoverflow_project_type([str(tag), *[str(item) for item in tags]])
+    ordered = {
+        "lang": data_info.get("lang") or "",
+        "source": data_info.get("source") or STACKOVERFLOW_SOURCE_NAME,
+        "url": data_info.get("url") or "",
+        "type": data_info.get("type") or "技术问答",
+        "author": data_info.get("author") or "unknown",
+        "public_date": data_info.get("public_date") or "",
+        "project_type": data_info.get("project_type") or "General Programming",
+    }
+    meta["data_info"] = ordered
+    meta.pop("stackoverflow_info", None)
+    return record
+
+
+def normalize_stackoverflow_jsonl(input_path: Path, output_path: Path) -> int:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with input_path.open("r", encoding="utf-8") as src, output_path.open("w", encoding="utf-8") as dst:
+        for line in src:
+            line = line.strip()
+            if not line:
+                continue
+            record = normalize_stackoverflow_record(json.loads(line))
+            dst.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            written += 1
+    return written
+
+
+def normalize_stackoverflow_jsonl_path(input_path: Path, output_path: Path) -> tuple[int, int]:
+    if input_path.is_dir():
+        output_path.mkdir(parents=True, exist_ok=True)
+        files_written = 0
+        records_written = 0
+        for child in sorted(input_path.rglob("*.jsonl")):
+            if not child.is_file():
+                continue
+            relative = child.relative_to(input_path)
+            records_written += normalize_stackoverflow_jsonl(child, output_path / relative)
+            files_written += 1
+        return files_written, records_written
+    records_written = normalize_stackoverflow_jsonl(input_path, output_path)
+    return 1, records_written
+
+
 def parse_stackoverflow_tags(value: str | None) -> list[str]:
     return re.findall(r"<([^>]+)>", value or "")
+
+
+def stackoverflow_tag_to_lang(tag: str) -> str:
+    normalized = tag.strip().lower()
+    return {
+        "c++": "C++",
+        "go": "Go",
+        "golang": "Go",
+        "java": "Java",
+        "javascript": "JavaScript",
+        "js": "JavaScript",
+        "python": "Python",
+        "typescript": "TypeScript",
+    }.get(normalized, tag)
+
+
+def infer_stackoverflow_project_type(tags: Sequence[str]) -> str:
+    normalized = {tag.strip().lower() for tag in tags}
+    if normalized & {
+        "algorithm",
+        "algorithms",
+        "data-structures",
+        "dynamic-programming",
+        "sorting",
+        "graph",
+        "tree",
+    }:
+        return "Algorithms & Data Structures"
+    if normalized & {
+        "sql",
+        "mysql",
+        "postgresql",
+        "sqlite",
+        "oracle-database",
+        "sql-server",
+        "mongodb",
+        "redis",
+        "database",
+    }:
+        return "Database"
+    if normalized & {
+        "machine-learning",
+        "data-science",
+        "pandas",
+        "numpy",
+        "tensorflow",
+        "pytorch",
+        "scikit-learn",
+        "r",
+        "matlab",
+    }:
+        return "Data Science & Machine Learning"
+    if normalized & {"android", "ios", "swift", "kotlin", "flutter", "react-native", "mobile"}:
+        return "Mobile App"
+    if normalized & {"unity-game-engine", "unity3d", "unreal-engine", "game-development", "pygame", "game"}:
+        return "Game Development"
+    if normalized & {
+        "docker",
+        "kubernetes",
+        "linux",
+        "aws",
+        "azure",
+        "google-cloud-platform",
+        "devops",
+        "nginx",
+        "apache",
+    }:
+        return "DevOps & Cloud"
+    if normalized & {"bash", "shell", "powershell", "scripting", "automation", "batch-file", "cmd"}:
+        return "Scripting & Automation"
+    if normalized & {"swing", "javafx", "wpf", "winforms", "qt", "tkinter", "electron", "desktop-application"}:
+        return "Desktop App"
+    if normalized & {"c", "c++", "rust", "assembly", "kernel", "linux-kernel", "memory-management", "pointers"}:
+        return "Systems & Low-Level"
+    if normalized & {
+        "html",
+        "css",
+        "javascript",
+        "typescript",
+        "reactjs",
+        "vue.js",
+        "angular",
+        "jquery",
+        "frontend",
+        "web-frontend",
+    }:
+        return "Web Frontend"
+    if normalized & {
+        "django",
+        "flask",
+        "spring",
+        "spring-boot",
+        "node.js",
+        "express",
+        "asp.net",
+        "php",
+        "ruby-on-rails",
+        "api",
+        "rest",
+        "backend",
+        "web-backend",
+    }:
+        return "Web Backend"
+    return "General Programming"
 
 
 def parse_stackoverflow_dump_date(value: str | None) -> dt.datetime:
@@ -1056,24 +1357,21 @@ def stackoverflow_dump_question_to_record(
             ]
         )
     creation_date = parse_stackoverflow_dump_date(question.get("CreationDate"))
+    tags = parse_stackoverflow_tags(question.get("Tags"))
+    data_info = {
+        "lang": stackoverflow_tag_to_lang(matching_tag),
+        "source": STACKOVERFLOW_SOURCE_NAME,
+        "url": f"https://stackoverflow.com/questions/{question_id}",
+        "type": "技术问答",
+        "author": question.get("OwnerDisplayName") or question.get("OwnerUserId") or "unknown",
+        "public_date": creation_date.isoformat(timespec="seconds"),
+        "project_type": infer_stackoverflow_project_type(tags),
+    }
     return anonymize_record({
         "id": f"stackoverflow_question_{question_id}",
         "text": "\n".join(part for part in text_parts if part is not None).strip() + "\n",
         "meta": {
-            "data_info": {
-                "source": STACKOVERFLOW_SOURCE_NAME,
-                "type": "技术问答",
-                "url": f"https://stackoverflow.com/questions/{question_id}",
-                "license": "CC BY-SA 4.0",
-                "site": "stackoverflow",
-                "tag": matching_tag,
-                "tags": parse_stackoverflow_tags(question.get("Tags")),
-                "score": int(question.get("Score") or 0),
-                "views": int(question.get("ViewCount") or 0),
-                "answer_count": int(question.get("AnswerCount") or 0),
-                "author": question.get("OwnerDisplayName") or question.get("OwnerUserId") or "unknown",
-                "public_date": creation_date.isoformat(timespec="seconds"),
-            }
+            "data_info": data_info,
         },
     })
 
@@ -2302,6 +2600,32 @@ def stackexchange_get_json(url: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def zhihu_api_get_json(
+    api_url: str,
+    query: str,
+    count: int,
+    access_secret: str,
+) -> dict:
+    params = urllib.parse.urlencode(
+        {
+            "Query": query,
+            "Count": min(10, max(1, count)),
+        }
+    )
+    request = urllib.request.Request(
+        f"{api_url}?{params}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_secret}",
+            "Content-Type": "application/json",
+            "User-Agent": "discussion-harvester/zhihu-api",
+            "X-Request-Timestamp": str(int(time.time())),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def public_article_get_text(url: str) -> str:
     request = urllib.request.Request(
         url,
@@ -3124,6 +3448,18 @@ def stackoverflow_dump_from_shards_main(argv: Sequence[str] | None = None) -> in
     return 0
 
 
+def normalize_stackoverflow_jsonl_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_normalize_stackoverflow_jsonl_args(argv)
+    start = time.time()
+    files_written, records_written = normalize_stackoverflow_jsonl_path(Path(args.input), Path(args.output))
+    print(
+        f"Wrote {records_written} normalized Stack Overflow records across {files_written} file(s) to {args.output}",
+        flush=True,
+    )
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
 def read_url_file(path: Path) -> list[str]:
     urls: list[str] = []
     with path.open("r", encoding="utf-8") as fp:
@@ -3168,6 +3504,39 @@ def discover_public_article_urls(
             print(f"{source} search {query} page {page}: found {new_count} new urls", flush=True)
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
+    return urls
+
+
+def discover_public_article_urls_from_search_urls(
+    source: str,
+    search_urls: Sequence[str],
+    sleep_seconds: float = 1.0,
+) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for search_url in search_urls:
+        canonical_search_url = canonical_public_article_url(search_url)
+        if not canonical_search_url:
+            continue
+        try:
+            html = public_article_get_text(search_url)
+        except urllib.error.HTTPError as exc:
+            print(f"{source} search-url {search_url}: HTTP {exc.code}; skipping", flush=True)
+            continue
+        except urllib.error.URLError as exc:
+            print(f"{source} search-url {search_url}: {exc}; skipping", flush=True)
+            continue
+        page_urls = extract_public_article_urls(html, source=source, base_url=search_url)
+        new_count = 0
+        for url in page_urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+            new_count += 1
+        print(f"{source} search-url {search_url}: found {new_count} new urls", flush=True)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
     return urls
 
 
@@ -3218,6 +3587,14 @@ def public_article_main(source: str, argv: Sequence[str] | None = None) -> int:
     urls.extend(args.url or [])
     if args.url_file:
         urls.extend(read_url_file(Path(args.url_file)))
+    if args.search_url and len(urls) < args.max_records:
+        urls.extend(
+            discover_public_article_urls_from_search_urls(
+                source=source,
+                search_urls=args.search_url,
+                sleep_seconds=args.sleep_seconds,
+            )
+        )
     if args.queries and len(urls) < args.max_records:
         urls.extend(
             discover_public_article_urls(
@@ -3237,6 +3614,133 @@ def public_article_main(source: str, argv: Sequence[str] | None = None) -> int:
     output_path = output_dir / f"{source}_articles.jsonl"
     written = write_stackoverflow_records(records, output_path)
     print(f"Wrote {written} {source} records to {output_path}", flush=True)
+    print(f"Done in {time.time() - start:.1f}s", flush=True)
+    return 0
+
+
+def fetch_zhihu_api_records(
+    queries: Sequence[str],
+    access_secrets: Sequence[str],
+    api_url: str,
+    count: int,
+    max_records: int,
+    min_chars: int,
+    sleep_seconds: float = 1.0,
+    daily_quota_per_account: int = 5000,
+) -> list[dict]:
+    records: list[dict] = []
+    seen_ids: set[str] = set()
+    tokens = [token for token in access_secrets if token]
+    if not tokens:
+        return records
+    token_uses = [0 for _ in tokens]
+    disabled_tokens: set[int] = set()
+    token_index = 0
+
+    def next_token_index() -> int | None:
+        nonlocal token_index
+        if len(disabled_tokens) >= len(tokens):
+            return None
+        for _ in range(len(tokens)):
+            candidate = token_index % len(tokens)
+            token_index += 1
+            if candidate in disabled_tokens:
+                continue
+            if daily_quota_per_account > 0 and token_uses[candidate] >= daily_quota_per_account:
+                disabled_tokens.add(candidate)
+                continue
+            return candidate
+        return None
+
+    for query in queries:
+        if len(records) >= max_records:
+            break
+        selected_token_index = next_token_index()
+        if selected_token_index is None:
+            print("zhihu-api: no access secret with remaining quota; stopping", flush=True)
+            break
+        try:
+            payload = zhihu_api_get_json(
+                api_url=api_url,
+                query=query,
+                count=count,
+                access_secret=tokens[selected_token_index],
+            )
+            token_uses[selected_token_index] += 1
+        except urllib.error.HTTPError as exc:
+            token_uses[selected_token_index] += 1
+            if exc.code in {401, 403, 429}:
+                disabled_tokens.add(selected_token_index)
+                print(f"zhihu-api {query}: HTTP {exc.code}; disabled account #{selected_token_index + 1}", flush=True)
+            else:
+                print(f"zhihu-api {query}: HTTP {exc.code}; skipped", flush=True)
+            continue
+        except urllib.error.URLError as exc:
+            print(f"zhihu-api {query}: {exc}; skipped", flush=True)
+            continue
+        if int(payload.get("Code") or payload.get("code") or 0) != 0:
+            message = payload.get("Message") or payload.get("msg") or "unknown error"
+            code = int(payload.get("Code") or payload.get("code") or 0)
+            if code in {20001, 30001}:
+                disabled_tokens.add(selected_token_index)
+                print(f"zhihu-api {query}: API error {code} {message}; disabled account #{selected_token_index + 1}", flush=True)
+            else:
+                print(f"zhihu-api {query}: API error {code} {message}; skipped", flush=True)
+            continue
+        data = payload.get("Data") or payload.get("data") or {}
+        items = data.get("Items") or data.get("items") or []
+        written_for_query = 0
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                record = zhihu_api_item_to_record(item, query=query, min_chars=min_chars)
+                if record is None or record["id"] in seen_ids:
+                    continue
+                seen_ids.add(record["id"])
+                records.append(record)
+                written_for_query += 1
+                if len(records) >= max_records:
+                    break
+        print(
+            f"zhihu-api {query}: account=#{selected_token_index + 1} "
+            f"calls={token_uses[selected_token_index]}/{daily_quota_per_account if daily_quota_per_account > 0 else 'unlimited'} "
+            f"wrote {written_for_query} records from {len(items) if isinstance(items, list) else 0} items",
+            flush=True,
+        )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return records
+
+
+def zhihu_api_main(argv: Sequence[str] | None = None) -> int:
+    args = parse_zhihu_api_args(argv)
+    start = time.time()
+    access_secrets = resolve_zhihu_access_secrets(args.access_secret)
+    if not access_secrets:
+        print(
+            "Missing Zhihu Access Secret. Pass --access-secret, set ZHIHU_ACCESS_SECRET, or add zhihu/zhihu_accounts/zhihu_access_secret to token.json.",
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        f"Using Zhihu official search API ({args.api_url}) with {len(access_secrets)} account(s), "
+        f"quota_per_account={args.daily_quota_per_account}",
+        flush=True,
+    )
+    records = fetch_zhihu_api_records(
+        queries=args.queries,
+        access_secrets=access_secrets,
+        api_url=args.api_url,
+        count=args.count,
+        max_records=max(0, args.max_records),
+        min_chars=max(0, args.min_chars),
+        sleep_seconds=args.sleep_seconds,
+        daily_quota_per_account=args.daily_quota_per_account,
+    )
+    output_path = Path(args.output_dir) / "zhihu_api_articles.jsonl"
+    written = write_stackoverflow_records(records, output_path)
+    print(f"Wrote {written} zhihu-api records to {output_path}", flush=True)
     print(f"Done in {time.time() - start:.1f}s", flush=True)
     return 0
 
