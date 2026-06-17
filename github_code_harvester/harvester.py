@@ -1244,17 +1244,34 @@ def infer_stackoverflow_project_type(tags: Sequence[str]) -> str:
     }:
         return "Algorithms & Data Structures"
     if normalized & {
-        "sql",
-        "mysql",
-        "postgresql",
-        "sqlite",
-        "oracle-database",
-        "sql-server",
-        "mongodb",
-        "redis",
-        "database",
+        "django",
+        "django-cms",
+        "flask",
+        "fastapi",
+        "bottle",
+        "spring",
+        "spring-boot",
+        "spring-mvc",
+        "servlets",
+        "servlet",
+        "node.js",
+        "express",
+        "express.js",
+        "nestjs",
+        "koa",
+        "socket.io",
+        "asp.net",
+        "asp.net-mvc",
+        "php",
+        "laravel",
+        "ruby-on-rails",
+        "rails",
+        "api",
+        "rest",
+        "backend",
+        "web-backend",
     }:
-        return "Database"
+        return "Web Backend"
     if normalized & {
         "machine-learning",
         "data-science",
@@ -1290,34 +1307,39 @@ def infer_stackoverflow_project_type(tags: Sequence[str]) -> str:
     if normalized & {"c", "c++", "rust", "assembly", "kernel", "linux-kernel", "memory-management", "pointers"}:
         return "Systems & Low-Level"
     if normalized & {
+        "sql",
+        "mysql",
+        "postgresql",
+        "sqlite",
+        "oracle-database",
+        "sql-server",
+        "mongodb",
+        "redis",
+        "database",
+        "join",
+        "indexing",
+        "stored-procedures",
+        "stored-procedure",
+        "query",
+    }:
+        return "Database"
+    if normalized & {
         "html",
         "css",
-        "javascript",
-        "typescript",
         "reactjs",
+        "react.js",
         "vue.js",
         "angular",
+        "angularjs",
         "jquery",
+        "dom",
+        "browser",
+        "fabric.js",
+        "fabricjs",
         "frontend",
         "web-frontend",
     }:
         return "Web Frontend"
-    if normalized & {
-        "django",
-        "flask",
-        "spring",
-        "spring-boot",
-        "node.js",
-        "express",
-        "asp.net",
-        "php",
-        "ruby-on-rails",
-        "api",
-        "rest",
-        "backend",
-        "web-backend",
-    }:
-        return "Web Backend"
     return "General Programming"
 
 

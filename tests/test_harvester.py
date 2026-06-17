@@ -31,6 +31,7 @@ from github_code_harvester.harvester import (
     is_code_commit,
     is_eligible_repo,
     infer_project_type,
+    infer_stackoverflow_project_type,
     load_failed_repos_from_csv,
     read_failed_repo_names,
     merge_commit_jsons_to_jsonl,
@@ -1337,6 +1338,23 @@ def test_normalize_stackoverflow_jsonl_path_converts_directory(tmp_path: Path):
     assert second["meta"]["data_info"]["project_type"] == "Web Frontend"
     assert set(first["meta"]) == {"data_info"}
     assert set(second["meta"]) == {"data_info"}
+
+
+def test_infer_stackoverflow_project_type_prefers_backend_frameworks():
+    assert infer_stackoverflow_project_type(["javascript", "node.js", "socket.io"]) == "Web Backend"
+    assert infer_stackoverflow_project_type(["python", "django", "postgis"]) == "Web Backend"
+    assert infer_stackoverflow_project_type(["python", "bottle"]) == "Web Backend"
+    assert infer_stackoverflow_project_type(["java", "spring-mvc", "servlets"]) == "Web Backend"
+
+
+def test_infer_stackoverflow_project_type_keeps_core_database_questions_database():
+    assert infer_stackoverflow_project_type(["mysql", "sql", "join"]) == "Database"
+    assert infer_stackoverflow_project_type(["postgresql", "stored-procedures", "indexing"]) == "Database"
+
+
+def test_infer_stackoverflow_project_type_does_not_treat_plain_javascript_as_frontend():
+    assert infer_stackoverflow_project_type(["javascript", "mocha", "async-await"]) == "General Programming"
+    assert infer_stackoverflow_project_type(["javascript", "angular"]) == "Web Frontend"
 
 
 def test_write_stackoverflow_dump_jsonl_streams_posts_xml(tmp_path: Path):
