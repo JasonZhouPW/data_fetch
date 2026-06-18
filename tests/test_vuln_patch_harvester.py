@@ -1,4 +1,5 @@
 import json
+import http.client
 import subprocess
 import urllib.error
 import urllib.parse
@@ -326,6 +327,94 @@ def test_fetch_nvd_cves_retries_rate_limit(monkeypatch):
     )
 
     assert [record["cve"]["id"] for record in records] == ["CVE-2099-0099"]
+    assert calls == 2
+    assert sleeps == [1]
+
+
+def test_fetch_nvd_cves_retries_incomplete_read(monkeypatch):
+    calls = 0
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "totalResults": 1,
+                    "resultsPerPage": 1,
+                    "vulnerabilities": [{"cve": {"id": "CVE-2099-0101"}}],
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout: int):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise http.client.IncompleteRead(b"{", 10)
+        return FakeResponse()
+
+    monkeypatch.setattr("vuln_patch_harvester.harvester.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("vuln_patch_harvester.harvester.time.sleep", sleeps.append)
+
+    records = fetch_nvd_cves(
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        results_per_page=1,
+        max_records=1,
+        retry_sleep_seconds=1,
+        request_interval_seconds=0,
+    )
+
+    assert [record["cve"]["id"] for record in records] == ["CVE-2099-0101"]
+    assert calls == 2
+    assert sleeps == [1]
+
+
+def test_fetch_nvd_cves_retries_timeout(monkeypatch):
+    calls = 0
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "totalResults": 1,
+                    "resultsPerPage": 1,
+                    "vulnerabilities": [{"cve": {"id": "CVE-2099-0102"}}],
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout: int):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("The read operation timed out")
+        return FakeResponse()
+
+    monkeypatch.setattr("vuln_patch_harvester.harvester.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("vuln_patch_harvester.harvester.time.sleep", sleeps.append)
+
+    records = fetch_nvd_cves(
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        results_per_page=1,
+        max_records=1,
+        retry_sleep_seconds=1,
+        request_interval_seconds=0,
+    )
+
+    assert [record["cve"]["id"] for record in records] == ["CVE-2099-0102"]
     assert calls == 2
     assert sleeps == [1]
 

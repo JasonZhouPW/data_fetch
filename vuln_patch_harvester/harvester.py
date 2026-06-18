@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import os
 import re
@@ -213,6 +214,28 @@ def fetch_json(
                 flush=True,
             )
             time.sleep(sleep_seconds)
+            attempt += 1
+        except http.client.IncompleteRead as exc:
+            if attempt >= max_retries:
+                raise
+            print(
+                f"NVD request read incomplete response; retrying in {retry_sleep_seconds:g}s "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(retry_sleep_seconds)
+            attempt += 1
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if attempt >= max_retries:
+                raise
+            print(
+                f"NVD request failed with {exc.__class__.__name__}; retrying in {retry_sleep_seconds:g}s "
+                f"({attempt + 1}/{max_retries})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(retry_sleep_seconds)
             attempt += 1
 
 
