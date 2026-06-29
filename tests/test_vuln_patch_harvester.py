@@ -233,6 +233,7 @@ def test_write_jsonl_anonymizes_unique_identifiers(tmp_path: Path):
 
 def test_fetch_nvd_cves_paginates_api(monkeypatch):
     calls: list[str] = []
+    timeouts: list[float] = []
 
     class FakeResponse:
         def __init__(self, payload: dict):
@@ -249,6 +250,7 @@ def test_fetch_nvd_cves_paginates_api(monkeypatch):
 
     def fake_urlopen(request, timeout: int):
         calls.append(request.full_url)
+        timeouts.append(timeout)
         query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
         start_index = int(query["startIndex"][0])
         if start_index == 0:
@@ -285,6 +287,7 @@ def test_fetch_nvd_cves_paginates_api(monkeypatch):
     assert first_query["pubEndDate"] == ["2026-01-02T00:00:00.000Z"]
     assert first_query["resultsPerPage"] == ["1"]
     assert first_query["startIndex"] == ["0"]
+    assert timeouts == [180.0, 180.0]
 
 
 def test_fetch_nvd_cves_retries_rate_limit(monkeypatch):
@@ -448,7 +451,40 @@ def test_fetch_nvd_cves_throttles_without_api_key(monkeypatch):
         max_records=1,
     )
 
-    assert sleeps == [7.0]
+    assert sleeps == [10.0]
+
+
+def test_fetch_nvd_cves_throttles_with_api_key(monkeypatch):
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "totalResults": 1,
+                    "resultsPerPage": 1,
+                    "vulnerabilities": [{"cve": {"id": "CVE-2099-0103"}}],
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr("vuln_patch_harvester.harvester.urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    monkeypatch.setattr("vuln_patch_harvester.harvester.time.sleep", sleeps.append)
+
+    fetch_nvd_cves(
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        results_per_page=1,
+        max_records=1,
+        api_key="secret",
+    )
+
+    assert sleeps == [2.0]
 
 
 def test_write_nvd_cves_outputs_jsonl(tmp_path: Path):
@@ -473,9 +509,10 @@ def test_harvest_nvd_seed_candidates_fetches_until_target(monkeypatch):
         results_per_page=2000,
         max_records=None,
         api_key=None,
-        max_retries=3,
-        retry_sleep_seconds=10.0,
+        max_retries=10,
+        retry_sleep_seconds=30.0,
         request_interval_seconds=None,
+        request_timeout_seconds=180.0,
     ):
         calls.append((start_date, end_date, max_records))
         if len(calls) == 1:
